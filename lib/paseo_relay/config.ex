@@ -9,6 +9,14 @@ defmodule PaseoRelay.Config do
     connections_per_acceptor: 200,
     connection_retry_count: 5,
     connection_retry_wait_ms: 1_000,
+    ingress_budget_bytes: 512 * 1024 * 1024,
+    ingress_weight: 4,
+    delivery_timeout_ms: 30_000,
+    payload_timeout_ms: 30_000,
+    data_attach_timeout_ms: 15_000,
+    tcp_receive_buffer_bytes: 64 * 1024,
+    websocket_max_heap_words: 32 * 1024 * 1024,
+    memory_watermark_bytes: 0,
     node_name: nil,
     cookie: nil
   }
@@ -43,6 +51,58 @@ defmodule PaseoRelay.Config do
              "PASEO_RELAY_CONNECTION_RETRY_WAIT_MS",
              @defaults.connection_retry_wait_ms,
              0..60_000
+           ),
+         {:ok, ingress_budget_bytes} <-
+           integer(
+             environment,
+             "PASEO_RELAY_INGRESS_BUDGET_BYTES",
+             @defaults.ingress_budget_bytes,
+             (128 * 1024 * 1024)..(8 * 1024 * 1024 * 1024)
+           ),
+         {:ok, ingress_weight} <-
+           integer(environment, "PASEO_RELAY_INGRESS_WEIGHT", @defaults.ingress_weight, 1..16),
+         :ok <- validate_ingress_budget(ingress_budget_bytes, ingress_weight),
+         {:ok, delivery_timeout_ms} <-
+           integer(
+             environment,
+             "PASEO_RELAY_DELIVERY_TIMEOUT_MS",
+             @defaults.delivery_timeout_ms,
+             100..120_000
+           ),
+         {:ok, payload_timeout_ms} <-
+           integer(
+             environment,
+             "PASEO_RELAY_PAYLOAD_TIMEOUT_MS",
+             @defaults.payload_timeout_ms,
+             1_000..300_000
+           ),
+         {:ok, data_attach_timeout_ms} <-
+           integer(
+             environment,
+             "PASEO_RELAY_DATA_ATTACH_TIMEOUT_MS",
+             @defaults.data_attach_timeout_ms,
+             1_000..120_000
+           ),
+         {:ok, tcp_receive_buffer_bytes} <-
+           integer(
+             environment,
+             "PASEO_RELAY_TCP_RECEIVE_BUFFER_BYTES",
+             @defaults.tcp_receive_buffer_bytes,
+             (4 * 1024)..(1024 * 1024)
+           ),
+         {:ok, websocket_max_heap_words} <-
+           integer(
+             environment,
+             "PASEO_RELAY_WEBSOCKET_MAX_HEAP_WORDS",
+             @defaults.websocket_max_heap_words,
+             (32 * 1024 * 1024)..(128 * 1024 * 1024)
+           ),
+         {:ok, memory_watermark_bytes} <-
+           disabled_or_integer(
+             environment,
+             "PASEO_RELAY_MEMORY_WATERMARK_BYTES",
+             @defaults.memory_watermark_bytes,
+             (256 * 1024 * 1024)..(64 * 1024 * 1024 * 1024)
            ) do
       {:ok,
        %{
@@ -54,6 +114,14 @@ defmodule PaseoRelay.Config do
          connections_per_acceptor: connections_per_acceptor,
          connection_retry_count: connection_retry_count,
          connection_retry_wait_ms: connection_retry_wait_ms,
+         ingress_budget_bytes: ingress_budget_bytes,
+         ingress_weight: ingress_weight,
+         delivery_timeout_ms: delivery_timeout_ms,
+         payload_timeout_ms: payload_timeout_ms,
+         data_attach_timeout_ms: data_attach_timeout_ms,
+         tcp_receive_buffer_bytes: tcp_receive_buffer_bytes,
+         websocket_max_heap_words: websocket_max_heap_words,
+         memory_watermark_bytes: memory_watermark_bytes,
          node_name: Map.get(environment, "RELEASE_NODE"),
          cookie: Map.get(environment, "RELEASE_COOKIE")
        }}
@@ -106,6 +174,23 @@ defmodule PaseoRelay.Config do
       "true" -> {:ok, true}
       "false" -> {:ok, false}
       _ -> {:error, "#{key} must be true or false"}
+    end
+  end
+
+  defp disabled_or_integer(environment, key, default, range) do
+    case Map.get(environment, key) do
+      nil -> {:ok, default}
+      "0" -> {:ok, 0}
+      _value -> integer(environment, key, default, range)
+    end
+  end
+
+  defp validate_ingress_budget(budget, weight) do
+    if budget >= PaseoRelay.Protocol.maximum_message_payload_bytes() * weight do
+      :ok
+    else
+      {:error,
+       "PASEO_RELAY_INGRESS_BUDGET_BYTES must admit one maximum assembled message at the configured weight"}
     end
   end
 end

@@ -10,13 +10,23 @@ defmodule PaseoRelay.Router do
          {:ok, connection} <- PaseoRelay.Connection.from_query(conn.query_params),
          decision <- PaseoRelay.Ownership.route(connection.server_id, target()),
          {:local, owner, reservation} <- decision do
+      options =
+        PaseoRelay.Protocol.websocket_options(
+          timeout: :infinity,
+          before_payload: &PaseoRelay.Delivery.Budget.reserve/1,
+          payload_timeout_ms: operation(:payload_timeout_ms, 30_000),
+          max_heap_size: %{
+            size: operation(:websocket_max_heap_words, 32 * 1024 * 1024),
+            include_shared_binaries: true,
+            kill: true
+          }
+        )
+
       conn
       |> WebSockAdapter.upgrade(
         PaseoRelay.Socket,
         %{connection: connection, owner: owner, reservation: reservation},
-        compress: false,
-        timeout: :infinity,
-        max_frame_size: 32 * 1024 * 1024
+        options
       )
       |> halt()
     else
@@ -40,6 +50,12 @@ defmodule PaseoRelay.Router do
   end
 
   defp target, do: Application.fetch_env!(:paseo_relay, :ownership_target)
+
+  defp operation(key, default) do
+    :paseo_relay
+    |> Application.get_env(:operations, [])
+    |> Keyword.get(key, default)
+  end
 
   defp require_websocket_upgrade(conn) do
     case WebSockAdapter.UpgradeValidation.validate_upgrade(conn) do

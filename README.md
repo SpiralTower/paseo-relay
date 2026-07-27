@@ -21,7 +21,13 @@ The Elixir and Erlang versions are managed with [asdf](https://asdf-vm.com/):
 asdf install
 mix deps.get
 mix test
+scripts/verify-patched-dependencies.sh
 ```
+
+The dependency verifier fetches pinned pristine Bandit and Thousand Island
+artifacts, verifies their hashes, compares the declared local patches, and runs
+both upstream suites. Pass `--include-slow` to include external Docker/Autobahn
+checks.
 
 See [LICENSE](LICENSE).
 
@@ -43,13 +49,37 @@ generic:
 | `PASEO_RELAY_CONNECTIONS_PER_ACCEPTOR` | `200` | Live connections allowed per acceptor; the default node ceiling is 20,000. |
 | `PASEO_RELAY_CONNECTION_RETRY_COUNT` | `5` | Bounded listener retries when an acceptor reaches its connection ceiling. |
 | `PASEO_RELAY_CONNECTION_RETRY_WAIT_MS` | `1000` | Delay between bounded listener retries. |
+| `PASEO_RELAY_INGRESS_BUDGET_BYTES` | `536870912` | Node-wide weighted WebSocket ingress ceiling. Must admit one maximum assembled message at the configured weight. |
+| `PASEO_RELAY_INGRESS_WEIGHT` | `4` | Conservative memory weight charged per wire payload byte. |
+| `PASEO_RELAY_DELIVERY_TIMEOUT_MS` | `30000` | Maximum reservation/write-barrier wait before a slow destination is shed. Also configures the TCP send timeout. |
+| `PASEO_RELAY_PAYLOAD_TIMEOUT_MS` | `30000` | Maximum time from first admitted data-frame payload through completion of its assembled WebSocket message before retryable `1013` closure. Interleaved control frames do not reset it. |
+| `PASEO_RELAY_DATA_ATTACH_TIMEOUT_MS` | `15000` | Maximum time a v2 client frame waits for its daemon-data socket. |
+| `PASEO_RELAY_TCP_RECEIVE_BUFFER_BYTES` | `65536` | Per-socket receive buffer limiting bytes accepted before header admission. |
+| `PASEO_RELAY_WEBSOCKET_MAX_HEAP_WORDS` | `33554432` | Per-WebSocket BEAM heap fuse, including shared binaries. Values below this protocol-safe floor are rejected. |
+| `PASEO_RELAY_MEMORY_WATERMARK_BYTES` | `0` | Optional BEAM total-memory watermark that closes the oldest backpressured source with `1013`; disabled generically because the safe threshold depends on the deployment memory limit. |
 | `RELEASE_NODE` / `RELEASE_COOKIE` | unset | Standard distributed-release identity. |
 
 `GET /health` is a liveness probe. `GET /ready` returns `200` only while the
 node accepts new work, and returns `503 {"status":"unready"}` while draining
 or below the configured cluster floor. `GET /metrics` is Prometheus text and
 exposes readiness, draining, active WebSockets, active sessions, reroutes,
-listener rejections, forwarded frames, and forwarded bytes for the local node.
+listener rejections, delivery pressure and latency, frame sizes, slow-consumer
+closes, ingress reservations, and BEAM memory for the local node.
+
+Payloads never pass through a node-wide relay mailbox. Each `serverId` Owner
+stores topology metadata only, and every destination has a Writer allowing one
+payload write at a time. During delivery Bandit suspends source reads but keeps
+the WebSocket process available for full-duplex writes; it rearms the source
+only after the destination's TCP send barrier. Kernel TCP pressure therefore
+reaches the producer without deadlocking simultaneous opposite-direction
+traffic. Header-time weighted admission bounds simultaneous frame extraction
+before payload bytes are read. An admitted data message, including every
+fragment in a fragmented message, must complete within one configured payload
+deadline, so header-only or non-final-fragment peers cannot retain weighted
+budget indefinitely. The protocol preserves its existing 32 MiB wire-frame
+ceiling (therefore 32 MiB minus the 14-byte client header for one maximum
+unfragmented payload) and separately allows an assembled fragmented-message
+payload of exactly 32 MiB.
 
 See [`OPERATIONS.md`](OPERATIONS.md) for the production failure model,
 capacity policy, and alerting signals.

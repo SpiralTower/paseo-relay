@@ -100,14 +100,17 @@ defmodule PaseoRelay.RouterIntegrationTest do
   test "metrics exposes local names and values", %{port: port} do
     before = PaseoRelay.Metrics.snapshot()
     {socket, _response} = open_websocket(port, "srv_metrics")
-    {:ok, _sync_frame} = :gen_tcp.recv(socket, 0, 2_000)
+
+    {:ok, <<0x81, sync_bytes, _sync_payload::binary-size(sync_bytes)>>} =
+      :gen_tcp.recv(socket, 0, 2_000)
+
     metrics = request(port, "/metrics")
 
     assert metric_value(metrics, "active_websockets") == before.active_websockets + 1
     assert metric_value(metrics, "active_sessions") == before.active_sessions + 1
     assert metric_value(metrics, "reroute_responses_total") == before.reroute_responses
-    assert metric_value(metrics, "frames_forwarded_total") == before.frames_forwarded
-    assert metric_value(metrics, "bytes_forwarded_total") == before.bytes_forwarded
+    assert metric_value(metrics, "frames_forwarded_total") == before.frames_forwarded + 1
+    assert metric_value(metrics, "bytes_forwarded_total") == before.bytes_forwarded + sync_bytes
     :gen_tcp.close(socket)
   end
 

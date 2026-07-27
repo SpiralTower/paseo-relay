@@ -26,9 +26,9 @@ defmodule PaseoRelay.OwnershipTest do
     owner_record = Ownership.owner_pid("server-b")
     owner_down = Process.monitor(owner_record)
     Process.exit(owner, :kill)
-    assert_receive {:DOWN, ^owner_down, :process, ^owner_record, :normal}
+    assert_receive {:DOWN, ^owner_down, :process, ^owner_record, _reason}
 
-    assert :unowned = Ownership.resolve("server-b")
+    assert :unowned = await_unowned("server-b")
     assert :local = Ownership.claim("server-b", "opaque-owner-c")
   end
 
@@ -45,6 +45,26 @@ defmodule PaseoRelay.OwnershipTest do
     assert {:ok, _token} = Task.await(reservation, 1_000)
 
     Process.exit(owner, :kill)
+  end
+
+  defp await_unowned(server_id) do
+    deadline = System.monotonic_time(:millisecond) + 5_000
+    await_unowned(server_id, deadline)
+  end
+
+  defp await_unowned(server_id, deadline) do
+    case Ownership.resolve(server_id) do
+      :unowned ->
+        :unowned
+
+      _owned ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          flunk("ownership did not clear for #{server_id}")
+        end
+
+        Process.sleep(10)
+        await_unowned(server_id, deadline)
+    end
   end
 end
 
@@ -139,9 +159,9 @@ defmodule PaseoRelay.DistributedOwnershipTest do
   } do
     results =
       Task.await_many([
-        Task.async(fn -> Ownership.route("server-c", "opaque-owner-a") end),
+        Task.async(fn -> await_route(node(), "server-c", "opaque-owner-a") end),
         Task.async(fn ->
-          :rpc.call(peer, Ownership, :route, ["server-c", "opaque-owner-b"])
+          await_route(peer, "server-c", "opaque-owner-b")
         end)
       ])
 
@@ -190,14 +210,16 @@ defmodule PaseoRelay.DistributedOwnershipTest do
     owner_record = Ownership.owner_pid("server-e")
     owner_down = Process.monitor(owner_record)
     Process.exit(local_session, :kill)
-    assert_receive {:DOWN, ^owner_down, :process, ^owner_record, :normal}, 5_500
+    assert_receive {:DOWN, ^owner_down, :process, ^owner_record, _reason}, 5_500
+    assert :unowned = await_resolve(node(), "server-e", :unowned)
 
     remote_session = :rpc.call(peer, :erlang, :spawn, [:timer, :sleep, [:infinity]])
 
     assert :local =
              :rpc.call(peer, Ownership, :claim, ["server-e", "opaque-owner-b", remote_session])
 
-    assert {:reroute, "opaque-owner-b"} = Ownership.resolve("server-e")
+    assert {:reroute, "opaque-owner-b"} =
+             await_resolve(node(), "server-e", {:reroute, "opaque-owner-b"})
   end
 
   @tag timeout: 30_000
@@ -534,6 +556,33 @@ defmodule PaseoRelay.DistributedOwnershipTest do
       {:local, owner, _reservation} -> [owner]
       {:reroute, _target} -> []
     end)
+  end
+
+  defp await_route(observer, server_id, target) do
+    deadline = System.monotonic_time(:millisecond) + 5_000
+    await_route(observer, server_id, target, deadline)
+  end
+
+  defp await_route(observer, server_id, target, deadline) do
+    result =
+      if observer == node() do
+        Ownership.route(server_id, target)
+      else
+        :rpc.call(observer, Ownership, :route, [server_id, target])
+      end
+
+    case result do
+      {:unavailable, :owner} ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          flunk("ownership route remained unavailable on #{observer}")
+        end
+
+        Process.sleep(10)
+        await_route(observer, server_id, target, deadline)
+
+      available ->
+        available
+    end
   end
 
   defp start_syn(peer) do

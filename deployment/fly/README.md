@@ -58,7 +58,10 @@ The entrypoint raises the per-process file descriptor limit to 100,000 by
 default. Override `PASEO_RELAY_NOFILE` when a deployment needs a different
 ceiling. The sample VM size and connection limits in `fly.toml` are starting
 points, not universal capacity claims; validate them against the deployment's
-traffic and memory profile.
+traffic and memory profile. The sample 2 GiB Machine explicitly enables the
+1.5 GiB BEAM memory watermark in `fly.toml`; recalculate or disable that value
+when changing Machine memory rather than inheriting a deployment-specific
+threshold blindly.
 
 ## Read-only health cookbook
 
@@ -100,7 +103,7 @@ curl --http1.1 -fsS \
 curl --http1.1 -fsS \
   -H "Fly-Force-Instance-Id: $MACHINE_ID" \
   "$RELAY_URL/metrics" \
-  | grep -E '^paseo_relay_(ready|draining|active_websockets|active_sessions|reroute_responses_total|connection_rejections_total|frames_forwarded_total|bytes_forwarded_total) '
+  | grep -E '^paseo_relay_(ready|draining|active_websockets|active_sessions|reroute_responses_total|connection_rejections_total|backpressured_sources|ingress_reserved_bytes|inflight_delivery_bytes|delivery_timeouts_total|slow_consumer_disconnects_total|beam_total_memory_bytes|beam_binary_memory_bytes) '
 ```
 
 Repeat for every started Machine. Record the values by region and Machine ID;
@@ -125,7 +128,7 @@ fly logs -a "$APP" --machine "$MACHINE_ID" --no-tail
 ```
 
 An OOM kill, exit, failed Fly health check, or increasing rejection counter is
-concrete evidence. A single slow probe, a transient Registry queue, CPU steal,
+concrete evidence. A single slow probe, transient backpressure, CPU steal,
 or load above the soft limit is not an incident by itself.
 
 ### 4. Distinguish Fly ingress from application health
@@ -143,20 +146,14 @@ fly ssh console -a "$APP" --machine "$MACHINE_ID" -C \
 - Forced-instance and loopback failure together point at the application or VM.
 - Do not deploy to test either hypothesis.
 
-### 5. Use only targeted BEAM diagnostics
+### 5. Use the bounded-pressure metrics
 
-Only after ordinary metrics are insufficient, inspect the Registry's queue
-length and memory. Never call `:sys.get_state/1` or enumerate Registry state on
-a live relay.
-
-```sh
-fly ssh console -a "$APP" --machine "$MACHINE_ID" -C \
-  'sh -lc '\''RELEASE_NODE="paseo_relay@$FLY_PRIVATE_IP" RELEASE_DISTRIBUTION=name ERL_AFLAGS="-proto_dist inet6_tcp" ELIXIR_ERL_OPTIONS=+fnu /app/bin/paseo_relay rpc "IO.inspect(Process.info(Process.whereis(PaseoRelay.Registry), [:message_queue_len, :memory]))"'\'''
-```
-
-Take two small samples several seconds apart. A queue that drains with readiness
-intact and no rejection growth is transient. A sustained or growing queue,
-timed-out RPC, readiness loss, or increasing rejections is actionable.
+Do not inspect Owner process state on a live relay. Take two `/metrics` samples
+several seconds apart. Ingress reservations and in-flight delivery bytes must
+remain under their configured ceilings. Backpressured sources that drain with
+readiness intact and no timeout growth are transient. Sustained pressure,
+increasing timeouts/slow-consumer closes, readiness loss, or increasing
+rejections is actionable.
 
 ## Verdicts
 
@@ -166,7 +163,7 @@ Use a short verdict and evidence, not a wall of telemetry:
   rejections; targeted queues are stable.
 - **WATCH:** one weak or transient signal without user impact. Re-sample; do not
   alert or intervene merely because a Machine is busy.
-- **INCIDENT:** repeated readiness failure, OOM/exit, sustained Registry
+- **INCIDENT:** repeated readiness failure, OOM/exit, sustained relay
   pressure, unreachable owner, or increasing rejection counter.
 
 Confirm an incident with repeated probes or two independent signals, except for

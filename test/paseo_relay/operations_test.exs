@@ -31,6 +31,12 @@ defmodule PaseoRelay.OperationsTest do
     assert metrics.resp_body =~ "# TYPE paseo_relay_connection_rejections_total counter"
     assert metrics.resp_body =~ "# TYPE paseo_relay_frames_forwarded_total counter"
     assert metrics.resp_body =~ "# TYPE paseo_relay_bytes_forwarded_total counter"
+    assert metrics.resp_body =~ "# TYPE paseo_relay_ingress_reserved_bytes gauge"
+    assert metrics.resp_body =~ "# TYPE paseo_relay_inflight_delivery_bytes gauge"
+    assert metrics.resp_body =~ "# TYPE paseo_relay_backpressured_sources gauge"
+    assert metrics.resp_body =~ "# TYPE paseo_relay_delivery_wait_seconds histogram"
+    assert metrics.resp_body =~ "# TYPE paseo_relay_frame_size_bytes histogram"
+    assert metrics.resp_body =~ "# TYPE paseo_relay_beam_binary_memory_bytes gauge"
     assert metrics.resp_body =~ "paseo_relay_ready 1"
     assert metrics.resp_body =~ "paseo_relay_draining 0"
   end

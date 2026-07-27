@@ -110,7 +110,7 @@ defmodule PaseoRelay.RelayProtocolTest do
     GenServer.stop(client)
   end
 
-  test "v2 sockets fail closed when the registry crashes" do
+  test "v2 payload delivery has no node-wide registry process" do
     port = available_port()
     {:ok, relay} = Bandit.start_link(plug: PaseoRelay.Router, port: port)
     Process.unlink(relay)
@@ -122,13 +122,12 @@ defmodule PaseoRelay.RelayProtocolTest do
     {:ok, data} = connect(v2_url(port, "server", "clt_registry_crash"))
     assert_receive {:relay_open, ^data}
 
-    :ok = WebSockex.send_frame(client, {:text, "before-registry-crash"})
-    assert_receive {:relay_frame, ^data, :text, "before-registry-crash"}
+    assert Process.whereis(PaseoRelay.Registry) == nil
 
-    Process.exit(Process.whereis(PaseoRelay.Registry), :kill)
+    :ok = WebSockex.send_frame(client, {:text, "owner-routed"})
+    assert_receive {:relay_frame, ^data, :text, "owner-routed"}
 
-    assert_receive {:relay_closed, ^client, {:remote, 1012, "Registry unavailable"}}, 1_000
-    assert_receive {:relay_closed, ^data, {:remote, 1012, "Registry unavailable"}}, 1_000
+    GenServer.stop(client)
   end
 
   test "v2 sockets fail closed when their distributed session owner exits" do

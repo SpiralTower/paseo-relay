@@ -17,14 +17,11 @@ Every recurring observability question must be answerable from `/metrics`,
 logs, or a new low-cardinality metric — never by interrogating live
 processes.
 
-- **Never call `:sys.get_state/1` (or any full-state dump) on the production
-  Registry or any singleton process.** Copying a large state term blocks the
-  process for the duration of the copy. This has wedged a production node:
-  full-state dumps issued while a reconnect surge was in flight saturated the
-  Registry mailbox, WebSocket attaches timed out and failed closed, the VM
-  degraded until its health check went critical, and the Machine had to be
-  restarted. The Registry serializes every frame on its node; seconds of
-  blocking are an outage.
+- **Never call `:sys.get_state/1` (or any full-state dump) on a production
+  Owner or singleton process.** Copying a large state term blocks that process.
+  The retired node-wide Registry was previously wedged this way during a
+  reconnect surge. Payloads now bypass global coordination, but full-state
+  diagnostics remain unsafe and unnecessary.
 - Targeted RPC reads during an incident are acceptable: `:syn.lookup/2` for a
   single key, one counter, one small map. Full-table or full-state scans are
   not, and the busiest node during a surge is the worst possible target.
@@ -105,25 +102,31 @@ existing client reconnect policy provide backpressure.
   re-claim on healthy nodes within seconds. Do not wait for a wedged node to
   recover on its own, and do not diagnose it with anything heavier than its
   logs. Planned follow-up: an in-VM watchdog that self-terminates the node
-  when its own readiness or Registry call latency degrades, so this recovery
+  when its own readiness or Owner call latency degrades, so this recovery
   does not require an operator.
 - **Fly Proxy loses the path to a locally healthy Machine:** forced-instance
-  requests time out even though loopback HTTP, the Registry, CPU, and memory
+  requests time out even though loopback HTTP, Owner routing, CPU, and memory
   remain healthy. New clients cannot reach sessions owned by that Machine.
   Start and verify the stopped spare in the same region before disturbing the
   affected Machine, then restart the affected Machine once. If the failure
   returns after a restart, replace the Machine on a fresh Fly host instead of
-  repeatedly restarting it. This is a platform ingress failure, not Registry
-  pressure, and changing relay size or Registry architecture will not repair it.
-- **The singleton Registry falls behind during a reconnect surge:** its mailbox
-  grows and targeted calls become slow even when total CPU is below saturation.
-  Off-heap mailbox storage prevents queued frame payloads from bloating the
-  Registry process heap, but it does not remove serialization. A short queue
-  spike that returns to zero without rejections or readiness loss is a warning,
-  not a reason to restart. A sustained or growing queue, timed-out targeted
-  calls, attachment failures, or lost readiness means the node is wedged; use
-  the restart procedure above and prioritize splitting Registry ownership by
-  `serverId`.
+  repeatedly restarting it. This is a platform ingress failure, not relay
+  pressure, and changing relay size will not repair it.
+- **A destination stops reading:** its Writer permits only one payload write.
+  Source reads remain suspended while its WebSocket process can still service
+  full-duplex writes. At the delivery/TCP send deadline the destination
+  receives retryable `1013`, while healthy fanout destinations continue. Increasing
+  `paseo_relay_backpressured_sources` is expected during brief congestion;
+  sustained growth plus delivery timeouts or slow-consumer closes is actionable.
+- **Ingress reaches the node budget:** frame-header admission blocks before
+  payload extraction and `paseo_relay_ingress_reserved_bytes` plateaus at the
+  configured ceiling. Admitted payloads and fragmented-message assemblies that
+  do not complete by their single configured deadline are explicitly closed
+  with `1013`, releasing their reservations to queued peers. Interleaved control
+  frames do not extend that deadline. The generic memory watermark is disabled; deployments that set
+  it must choose a threshold below their runtime memory limit with room for the
+  configured ingress budget and VM overhead. At that watermark, the oldest
+  blocked source is explicitly closed with `1013` until pressure falls.
 - **Two nodes concurrently claim a previously unowned `serverId`:** Syn favors
   availability, so both WebSockets can initially open against different local
   owners. Conflict resolution keeps one owner and closes sockets on the loser
@@ -160,11 +163,11 @@ Protect connected users before restoring the preferred topology.
   that has acquired sessions during an incident merely to restore the preferred
   topology.
 - Restart a Machine when it is wedged or unreachable, not merely busy. Afterward,
-  verify the Machine's forced-instance readiness, cluster readiness, Registry
+  verify the Machine's forced-instance readiness, cluster readiness, Owner
   responsiveness, and reconnect/session convergence before taking another
   action.
 - Do not repeatedly restart the same Machine. A recurring Fly ingress failure
-  calls for replacement on a fresh host; recurring Registry wedges call for an
+  calls for replacement on a fresh host; recurring relay pressure calls for an
   application fix. Repeated restarts only create repeated user-visible blips.
 - During unattended monitoring, do not deploy, resize, destroy Machines, change
   configuration, or run load tests. Record every intervention, its evidence,

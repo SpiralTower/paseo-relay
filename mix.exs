@@ -20,11 +20,12 @@ defmodule PaseoRelay.MixProject do
 
   defp deps do
     [
-      {:bandit, "~> 1.8"},
+      {:bandit, path: "third_party_bandit", override: true},
       {:dns_cluster, "~> 0.2.0"},
       {:jason, "~> 1.4"},
       {:plug, "~> 1.18"},
       {:syn, "~> 3.4"},
+      {:thousand_island, path: "third_party_thousand_island", override: true},
       {:websock_adapter, "~> 0.5"},
       {:websockex, "~> 0.4", only: :test}
     ]
