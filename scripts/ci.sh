@@ -50,6 +50,7 @@ assert_operations_contract() {
 }
 
 mix deps.get
+mix hex.audit
 mix format --check-formatted
 MIX_ENV=test mix compile --warnings-as-errors
 mix deps.unlock --check-unused

@@ -150,6 +150,17 @@
   load smoke completed 1,950/1,950 sustained frames, 151 reconnect-wave socket
   opens, and 200/200 ownership sockets with zero connection, send, ordering, or
   cleanup failures.
+- Hosted-CI red: the clean Ubuntu runner had no EPMD daemon, so the distributed
+  test bootstrap failed at `Node.start/2` before ExUnit ran. The test boundary
+  now starts the OTP-provided EPMD daemon explicitly before starting its named
+  node, matching the fresh-runner environment instead of depending on a daemon
+  left running by local development.
+- The same clean dependency fetch reported fixed memory-exhaustion advisories in
+  Cowboy 2.17 and Cowlib 2.18. The lock now resolves Cowboy 2.18, Cowlib 2.19,
+  and Ranch 2.2.1; `mix hex.audit` exits zero and is part of the mandatory CI
+  path. The two remaining ignored Cowlib advisories concern unused client-side
+  cookie encoding and invalid response-header construction rejected by Cowboy,
+  as documented beside the existing allowlist in `mix.exs`.
 
 ### Final standards architectural audit
 
