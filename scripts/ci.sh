@@ -93,6 +93,7 @@ node scripts/relay-load.mjs \
   --cleanup-grace 5 --drain-timeout 5
 
 docker run --detach --name "${fly_container}" \
+  --ulimit nofile=100000:100000 \
   --env FLY_APP_NAME=paseo-relay-ci \
   --env FLY_MACHINE_ID=ci-machine \
   --env FLY_PRIVATE_IP=::1 \

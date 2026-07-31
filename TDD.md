@@ -232,6 +232,12 @@
   production. The artifact probe now supplies loopback IPv6 as `FLY_PRIVATE_IP`
   and prints container logs if readiness fails, exercising the real adapter
   contract while keeping failures diagnosable.
+- That diagnostic boundary exposed the next clean-runner red before the release
+  started: GitHub's default Docker hard `nofile` limit was below the Fly
+  adapter's documented 100,000 descriptor requirement, so its mandatory
+  `ulimit` exited with `Operation not permitted`. The Fly artifact probe now
+  starts its container with the same 100,000 soft and hard descriptor limit as
+  the deployment contract rather than testing an incompatible Docker default.
 
 ### Final standards architectural audit
 
