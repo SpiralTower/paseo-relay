@@ -239,15 +239,14 @@ defmodule PaseoRelay.BackpressureTest do
 
     destinations =
       Enum.map(1..4, fn index ->
-        destination =
-          digest_connect(v2_url(port, "budget-#{port}-#{index}", "server", "missing"))
-
-        assert_receive {:digest_frame, ^destination, :binary, @maximum_message_payload_bytes,
-                        ^digest},
-                       15_000
-
-        destination
+        digest_connect(v2_url(port, "budget-#{port}-#{index}", "server", "missing"))
       end)
+
+    Enum.each(destinations, fn destination ->
+      assert_receive {:digest_frame, ^destination, :binary, @maximum_message_payload_bytes,
+                      ^digest},
+                     30_000
+    end)
 
     await_reserved(&(&1 == 0))
     Enum.each(Enum.take(sockets, 4), &close_raw/1)

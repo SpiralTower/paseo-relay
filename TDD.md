@@ -581,3 +581,11 @@
   reconnect wave. This covers boot-after-restart plus concurrent real-WebSocket
   behavior without moving the documented 23,000-socket staging gate into every
   pull request.
+- Clean-runner budget fixture: hosted seed `804904` exposed a test-only
+  serialization: four independent maximum-message sources shared one absolute
+  deadline, but the fixture attached and awaited each 32 MiB destination before
+  opening the next. The first 15-second digest wait expired on the loaded runner
+  even though the exact test and seed passed locally. The boundary now attaches
+  all four destinations before awaiting their digests, matching the concurrent
+  node-budget behavior under test. The exact 25-test backpressure module passed,
+  followed by three isolated passes of the corrected budget regression.
