@@ -598,3 +598,10 @@
   and stops. The exact Writer invariant and a real pressure-cancellation socket
   path passed four consecutive focused runs, the backpressure module passed
   27/27 at seed `804904`, and the complete local suite passed 80/80 at that seed.
+- Stalled-authority red/green: suspending a live Owner through the public socket
+  path previously timed out its caller but left the Owner registered and able to
+  accumulate queued requests. The timeout now kills that Owner, both sockets
+  fail closed, and Syn reaches `:unowned`. Separately, suspending Capacity made
+  `/metrics` perform four sequential five-second calls; one snapshot call now
+  returns all four transient gauges or one bounded fallback. Both public fault
+  tests passed four consecutive focused runs.

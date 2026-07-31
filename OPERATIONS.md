@@ -133,6 +133,10 @@ with room for the configured ingress budget and VM overhead.
   because no WebSocket close frame can traverse that blocked path. Increasing
   `paseo_relay_backpressured_sources` is expected during brief congestion;
   sustained growth plus delivery timeouts or slow-consumer closes is actionable.
+- **A session Owner stops servicing its mailbox:** the absolute delivery
+  deadline closes the source and forcibly retires the timed-out Owner. Syn
+  removes its registration, so reconnect can claim a fresh Owner instead of
+  adding work to an indefinitely stalled session authority.
 - **A control destination stops reading:** all control notifications use that
   destination's Writer. Once its bounded control queue fills, the control socket
   receives retryable `1013`; an accepted queued notification that reaches its
@@ -224,6 +228,12 @@ Fly scrapes `/metrics` every 15 seconds when the deployment adapter's metrics
 configuration is enabled. Custom series are local to a Machine and receive Fly
 labels such as app, region, host, and instance. Do not add `serverId` or
 `connectionId` as labels; their cardinality is unbounded.
+
+The endpoint fetches all transient capacity gauges in one bounded ledger call.
+If that authority is stalled, the scrape returns documented zero fallbacks
+after one timeout rather than serially blocking once per gauge. Readiness is a
+separate authority-health signal; do not interpret fallback zeros as spare
+capacity.
 
 Start with dashboards and alerts for:
 

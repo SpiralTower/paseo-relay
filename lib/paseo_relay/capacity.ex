@@ -8,6 +8,12 @@ defmodule PaseoRelay.Capacity do
   @pressure_recheck_ms 100
   @initial_max_shed_batch 64
   @max_shed_batch 1_024
+  @zero_snapshot %{
+    active_websockets: 0,
+    ingress_reserved_bytes: 0,
+    inflight_delivery_bytes: 0,
+    backpressured_sources: 0
+  }
 
   def start_link(config), do: GenServer.start_link(__MODULE__, config, name: __MODULE__)
 
@@ -30,6 +36,7 @@ defmodule PaseoRelay.Capacity do
   def cancel_message(token), do: call({:finish_message, token, false}, :ok)
 
   def value(name), do: call({:value, name}, 0)
+  def snapshot, do: call(:snapshot, @zero_snapshot)
   def check_now, do: call(:check_now, {:error, :unavailable})
   def set_watermark(bytes), do: call({:set_watermark, bytes}, {:error, :unavailable})
 
@@ -214,6 +221,17 @@ defmodule PaseoRelay.Capacity do
 
   def handle_call({:value, :backpressured_sources}, _from, state),
     do: {:reply, state.blocked_sources, state}
+
+  def handle_call(:snapshot, _from, state) do
+    snapshot = %{
+      active_websockets: state.active_websockets,
+      ingress_reserved_bytes: state.reserved_bytes,
+      inflight_delivery_bytes: state.inflight_bytes,
+      backpressured_sources: state.blocked_sources
+    }
+
+    {:reply, snapshot, state}
+  end
 
   def handle_call(:check_now, _from, state), do: {:reply, :ok, shed_if_needed(state)}
 

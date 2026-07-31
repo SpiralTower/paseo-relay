@@ -120,6 +120,7 @@ defmodule PaseoRelay.BackpressureTest do
     assert :ok = send_frame(source, :text, "owner-ready")
     assert {:text, "owner-ready"} = recv_server_frame(destination)
     owner = PaseoRelay.Ownership.owner_pid(server_id)
+    owner_ref = Process.monitor(owner)
     :ok = :sys.suspend(owner)
 
     on_exit(fn ->
@@ -127,12 +128,21 @@ defmodule PaseoRelay.BackpressureTest do
     end)
 
     assert :ok = send_frame(source, :text, "bounded-owner-lookup")
-    assert {:close, 1013, "Delivery unavailable"} = recv_until_close(source)
+    assert {:close, source_code, source_reason} = recv_until_close(source)
+
+    assert {source_code, source_reason} in [
+             {1012, "Session owner moved"},
+             {1013, "Delivery unavailable"}
+           ]
+
+    assert_receive {:DOWN, ^owner_ref, :process, ^owner, :killed}, 1_000
+    await_unowned(server_id)
     await_reserved(&(&1 == 0))
     await_metric(:backpressured_sources, &(&1 == 0))
     await_metric(:inflight_delivery_bytes, &(&1 == 0))
     close_raw(source)
-    close_raw_websocket(destination)
+    assert {:close, 1012, "Session owner moved"} = recv_until_close(destination)
+    close_raw(destination)
     await_metric(:active_websockets, &(&1 == 0))
   end
 
@@ -1407,6 +1417,21 @@ defmodule PaseoRelay.BackpressureTest do
   defp await_metric(name, predicate) do
     deadline = System.monotonic_time(:millisecond) + 5_000
     await_metric(name, predicate, deadline)
+  end
+
+  defp await_unowned(server_id, deadline \\ nil) do
+    deadline = deadline || System.monotonic_time(:millisecond) + 1_000
+
+    if PaseoRelay.Ownership.resolve(server_id) == :unowned do
+      :ok
+    else
+      if System.monotonic_time(:millisecond) >= deadline do
+        flunk("#{server_id} remained owned")
+      end
+
+      Process.sleep(10)
+      await_unowned(server_id, deadline)
+    end
   end
 
   defp await_metric(name, predicate, deadline) do

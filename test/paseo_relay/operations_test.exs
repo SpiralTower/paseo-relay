@@ -74,6 +74,23 @@ defmodule PaseoRelay.OperationsTest do
     assert PaseoRelay.Metrics.value(:reroute_responses) == reroutes_before_failure
   end
 
+  @tag timeout: 10_000
+  test "metrics uses one bounded Capacity lookup when the ledger is stalled" do
+    capacity = Process.whereis(PaseoRelay.Capacity)
+    :ok = :sys.suspend(capacity)
+
+    on_exit(fn ->
+      if Process.alive?(capacity), do: :sys.resume(capacity)
+    end)
+
+    response = Task.async(fn -> Operations.response("/metrics") end)
+    assert {:ok, {200, _content_type, metrics}} = Task.yield(response, 7_000)
+    assert metrics =~ "paseo_relay_active_websockets 0"
+    assert metrics =~ "paseo_relay_ingress_reserved_bytes 0"
+    assert metrics =~ "paseo_relay_inflight_delivery_bytes 0"
+    assert metrics =~ "paseo_relay_backpressured_sources 0"
+  end
+
   defp await_metrics_replacement(previous) do
     deadline = System.monotonic_time(:millisecond) + 1_000
     await_metrics_replacement(previous, deadline)

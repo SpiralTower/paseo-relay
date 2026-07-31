@@ -53,6 +53,7 @@ defmodule PaseoRelay.Metrics do
      Integer.to_string(@maximum_message_payload_bytes)}
   ]
   @computed_names ~w(active_websockets active_sessions ingress_reserved_bytes inflight_delivery_bytes backpressured_sources max_frame_bytes beam_total_memory beam_process_memory beam_binary_memory beam_ets_memory)a
+  @capacity_names ~w(active_websockets ingress_reserved_bytes inflight_delivery_bytes backpressured_sources)a
   @counter_names (@metrics |> Enum.map(&elem(&1, 0)) |> Kernel.--(@computed_names)) ++
                    [
                      :delivery_wait_microseconds,
@@ -86,7 +87,8 @@ defmodule PaseoRelay.Metrics do
   def value(name), do: :counters.get(counters(), index(name))
 
   def snapshot do
-    Map.new(Enum.map(@metrics, &elem(&1, 0)), &{&1, value(&1)})
+    capacity = PaseoRelay.Capacity.snapshot()
+    Map.new(Enum.map(@metrics, &elem(&1, 0)), &{&1, snapshot_value(&1, capacity)})
   end
 
   def observe_delivery_wait(native_duration) do
@@ -114,7 +116,7 @@ defmodule PaseoRelay.Metrics do
   end
 
   def render do
-    [render_metrics(), render_delivery_histogram(), render_frame_histogram()]
+    [render_metrics(snapshot()), render_delivery_histogram(), render_frame_histogram()]
     |> Enum.join("\n")
     |> Kernel.<>("\n")
   end
@@ -165,18 +167,23 @@ defmodule PaseoRelay.Metrics do
 
   defp index(name), do: Enum.find_index(@counter_names, &(&1 == name)) + 1
 
-  defp render_metrics do
+  defp render_metrics(values) do
     Enum.map_join(@metrics, "\n", fn {name, type, public_name, help} ->
       full_name = "paseo_relay_#{public_name}"
 
       [
         "# HELP #{full_name} #{help}",
         "# TYPE #{full_name} #{type}",
-        "#{full_name} #{value(name)}"
+        "#{full_name} #{Map.fetch!(values, name)}"
       ]
       |> Enum.join("\n")
     end)
   end
+
+  defp snapshot_value(name, capacity) when name in @capacity_names,
+    do: Map.fetch!(capacity, name)
+
+  defp snapshot_value(name, _capacity), do: value(name)
 
   defp render_delivery_histogram do
     name = "paseo_relay_delivery_wait_seconds"

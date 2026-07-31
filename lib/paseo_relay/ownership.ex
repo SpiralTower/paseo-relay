@@ -130,8 +130,12 @@ defmodule PaseoRelay.Ownership.Owner do
       timeout -> GenServer.call(owner, {:destinations, socket, deadline, attach_timeout}, timeout)
     end
   catch
-    :exit, {:timeout, _call} -> {:error, :owner_timeout}
-    :exit, _reason -> {:error, :owner_closed}
+    :exit, {:timeout, _call} ->
+      Process.exit(owner, :kill)
+      {:error, :owner_timeout}
+
+    :exit, _reason ->
+      {:error, :owner_closed}
   end
 
   def control(owner, socket, payload), do: call(owner, {:control, socket, payload})
