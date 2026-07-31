@@ -3,18 +3,20 @@ defmodule PaseoRelay.Delivery.Writer do
 
   use GenServer
 
+  alias PaseoRelay.Delivery.Deadline
+
   @type token :: reference()
   def start(destination, delivery_timeout_ms, control_queue_bytes),
     do: GenServer.start(__MODULE__, {destination, delivery_timeout_ms, control_queue_bytes})
 
   def reserve(writer, byte_count, deadline) do
-    GenServer.call(writer, {:reserve, byte_count, deadline}, :infinity)
+    call_until(writer, {:reserve, byte_count, deadline}, deadline)
   catch
     :exit, _reason -> {:error, :destination_closed}
   end
 
-  def write(writer, token, opcode, payload) do
-    GenServer.call(writer, {:write, token, opcode, payload}, :infinity)
+  def write(writer, token, opcode, payload, deadline) do
+    call_until(writer, {:write, token, opcode, payload}, deadline)
   catch
     :exit, _reason -> {:error, :destination_closed}
   end
@@ -47,7 +49,7 @@ defmodule PaseoRelay.Delivery.Writer do
 
   @impl true
   def handle_call({:reserve, byte_count, deadline}, from, %{active: nil} = state) do
-    case remaining(deadline) do
+    case Deadline.remaining(deadline) do
       0 -> {:reply, {:error, :timeout}, state}
       timeout -> grant(from, byte_count, timeout, state)
     end
@@ -84,7 +86,10 @@ defmodule PaseoRelay.Delivery.Writer do
   end
 
   defp enqueue_control(payload, deadline, %{active: nil} = state) do
-    {:reply, :ok, start_control(payload, deadline, state)}
+    case start_control(payload, deadline, state) do
+      {:ok, state} -> {:reply, :ok, state}
+      {:expired, state} -> {:stop, :normal, {:error, :timeout}, state}
+    end
   end
 
   defp enqueue_control(payload, deadline, state) do
@@ -108,7 +113,7 @@ defmodule PaseoRelay.Delivery.Writer do
 
   @impl true
   def handle_info({:written, reference}, %{active: %{write_reference: reference}} = state) do
-    {:noreply, complete_active(state, :ok)}
+    continue_or_stop(complete_active(state, :ok))
   end
 
   def handle_info({:reservation_timeout, token}, %{active: %{token: token}} = state) do
@@ -130,7 +135,7 @@ defmodule PaseoRelay.Delivery.Writer do
         {:DOWN, reference, :process, _pid, _reason},
         %{active: %{source_ref: reference}} = state
       ) do
-    {:noreply, complete_active(state, {:error, :source_closed})}
+    continue_or_stop(complete_active(state, {:error, :source_closed}))
   end
 
   def handle_info(_message, state), do: {:noreply, state}
@@ -164,19 +169,19 @@ defmodule PaseoRelay.Delivery.Writer do
   defp grant_next(state) do
     case :queue.out(state.queued) do
       {:empty, _queue} ->
-        state
+        {:ok, state}
 
       {{:value, %{kind: :payload} = entry}, queued} ->
         state = %{state | queued: queued}
 
-        case remaining(entry.deadline) do
+        case Deadline.remaining(entry.deadline) do
           0 ->
             GenServer.reply(entry.from, {:error, :timeout})
             grant_next(state)
 
           timeout ->
             {:noreply, state} = grant(entry.from, entry.bytes, timeout, state)
-            state
+            {:ok, state}
         end
 
       {{:value, %{kind: :control} = entry}, queued} ->
@@ -186,9 +191,7 @@ defmodule PaseoRelay.Delivery.Writer do
             queued_control_bytes: state.queued_control_bytes - entry.bytes
         }
 
-        entry.payload
-        |> start_control(entry.deadline, state)
-        |> grant_next_if_expired_control()
+        start_control(entry.payload, entry.deadline, state)
     end
   end
 
@@ -210,9 +213,12 @@ defmodule PaseoRelay.Delivery.Writer do
   end
 
   defp start_control(payload, deadline, state) do
-    case remaining(deadline) do
+    case Deadline.remaining(deadline) do
       0 ->
-        state
+        PaseoRelay.Metrics.inc(:delivery_timeouts)
+        PaseoRelay.Metrics.inc(:slow_consumer_disconnects)
+        send(state.destination, {:relay_close, 1013, "Slow consumer"})
+        {:expired, reject_all(state, {:error, :timeout})}
 
       timeout ->
         reference = make_ref()
@@ -232,14 +238,17 @@ defmodule PaseoRelay.Delivery.Writer do
           write_reference: reference
         }
 
-        %{state | active: active}
+        {:ok, %{state | active: active}}
     end
   end
 
-  defp grant_next_if_expired_control(%{active: nil} = state), do: grant_next(state)
-  defp grant_next_if_expired_control(state), do: state
+  defp continue_or_stop({:ok, state}), do: {:noreply, state}
+  defp continue_or_stop({:expired, state}), do: {:stop, :normal, state}
 
-  defp remaining(deadline) do
-    max(deadline - System.monotonic_time(:millisecond), 0)
+  defp call_until(writer, message, deadline) do
+    case Deadline.remaining(deadline) do
+      0 -> {:error, :timeout}
+      timeout -> GenServer.call(writer, message, timeout)
+    end
   end
 end

@@ -104,6 +104,7 @@ defmodule PaseoRelay.Ownership.Owner do
   use GenServer
 
   alias PaseoRelay.Connection
+  alias PaseoRelay.Delivery.Deadline
   alias PaseoRelay.Delivery.Writer
 
   @reservation_ms 5_000
@@ -123,9 +124,13 @@ defmodule PaseoRelay.Ownership.Owner do
   def detach(owner, socket), do: GenServer.cast(owner, {:detach, socket})
   def legacy(owner, socket), do: call(owner, {:legacy, socket})
 
-  def destinations(owner, socket, timeout) do
-    GenServer.call(owner, {:destinations, socket, timeout}, :infinity)
+  def destinations(owner, socket, deadline, attach_timeout) do
+    case Deadline.remaining(deadline) do
+      0 -> {:error, :owner_timeout}
+      timeout -> GenServer.call(owner, {:destinations, socket, deadline, attach_timeout}, timeout)
+    end
   catch
+    :exit, {:timeout, _call} -> {:error, :owner_timeout}
     :exit, _reason -> {:error, :owner_closed}
   end
 
@@ -170,27 +175,32 @@ defmodule PaseoRelay.Ownership.Owner do
     attach_reservation(state, token, socket, {connection, writer})
   end
 
-  def handle_call({:destinations, socket, timeout}, from, state) do
-    case state.sockets[socket] do
-      %{connection: %Connection{version: 1} = connection} ->
+  def handle_call({:destinations, socket, deadline, attach_timeout}, from, state) do
+    timeout = min(Deadline.remaining(deadline), attach_timeout)
+
+    case {timeout, state.sockets[socket]} do
+      {0, _socket_state} ->
+        {:reply, {:error, :owner_timeout}, state}
+
+      {_timeout, %{connection: %Connection{version: 1} = connection}} ->
         target = state.v1[opposite(connection.role)]
         {:reply, {:ok, writers(state, [target])}, state}
 
-      %{connection: %Connection{version: 2, role: :client} = connection} ->
+      {timeout, %{connection: %Connection{version: 2, role: :client} = connection}} ->
         case state.data[connection.connection_id] do
           nil -> wait_for_data(state, from, socket, connection.connection_id, timeout)
           target -> {:reply, {:ok, writers(state, [target])}, state}
         end
 
-      %{connection: %Connection{version: 2, role: :server, connection_id: id}}
+      {_timeout, %{connection: %Connection{version: 2, role: :server, connection_id: id}}}
       when id != "" ->
         targets = state.clients[id] || MapSet.new()
         {:reply, {:ok, writers(state, targets)}, state}
 
-      %{connection: %Connection{version: 2, role: :server, connection_id: ""}} ->
+      {_timeout, %{connection: %Connection{version: 2, role: :server, connection_id: ""}}} ->
         {:reply, {:ok, :control}, state}
 
-      _ ->
+      {_timeout, _missing} ->
         {:reply, {:error, :detached}, state}
     end
   end

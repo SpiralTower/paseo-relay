@@ -4,6 +4,7 @@ defmodule PaseoRelay.Socket do
   @behaviour :cowboy_websocket
 
   alias PaseoRelay.Delivery
+  alias PaseoRelay.Delivery.Deadline
   alias PaseoRelay.Delivery.Writer
   alias PaseoRelay.Ownership.Owner
 
@@ -11,14 +12,7 @@ defmodule PaseoRelay.Socket do
   def init(request, options) do
     with true <- :cowboy_websocket.is_upgrade_request(request),
          {:ok, connection} <- connection(request),
-         decision <-
-           PaseoRelay.Ownership.route(
-             connection.server_id,
-             options.ownership_target,
-             options.config.minimum_cluster_size
-           ),
-         {:local, owner, reservation} <- decision,
-         {:ok, admission} <- admit(options.connection_budget, owner, reservation) do
+         {:local, owner, reservation, admission} <- route(connection, options) do
       state = %{
         admission: admission,
         config: options.config,
@@ -40,6 +34,10 @@ defmodule PaseoRelay.Socket do
       {:error, :capacity} ->
         PaseoRelay.Metrics.inc(:connection_rejections)
         reply(request, 503, %{}, "Relay connection capacity")
+
+      {:error, :pressure} ->
+        PaseoRelay.Metrics.inc(:connection_rejections)
+        reply(request, 503, %{}, "Relay memory pressure")
 
       {:error, :configuration_mismatch} ->
         reply(request, 503, %{}, "Relay capacity configuration")
@@ -184,7 +182,8 @@ defmodule PaseoRelay.Socket do
     case PaseoRelay.Capacity.start_delivery(token) do
       :ok ->
         source = self()
-        task = Task.async(fn -> deliver_input(payload, opcode, state, source) end)
+        deadline = Deadline.after_ms(state.config.delivery_timeout_ms)
+        task = Task.async(fn -> deliver_input(payload, opcode, state, source, deadline) end)
 
         delivery = %{
           ref: task.ref,
@@ -215,12 +214,11 @@ defmodule PaseoRelay.Socket do
     end
   end
 
-  defp deliver_input(payload, opcode, state, source) do
-    timeout = state.config.delivery_timeout_ms
+  defp deliver_input(payload, opcode, state, source, deadline) do
     attach_timeout = state.config.data_attach_timeout_ms
 
-    case Owner.destinations(state.owner, source, attach_timeout) do
-      {:ok, destinations} -> Delivery.deliver(destinations, opcode, payload, timeout)
+    case Owner.destinations(state.owner, source, deadline, attach_timeout) do
+      {:ok, destinations} -> Delivery.deliver(destinations, opcode, payload, deadline)
       {:error, :attach_timeout} -> {:error, :attach_timeout}
       {:error, _reason} -> {:error, :delivery_unavailable}
     end
@@ -273,14 +271,35 @@ defmodule PaseoRelay.Socket do
     PaseoRelay.Connection.from_query(query)
   end
 
-  defp admit({namespace, limit}, owner, reservation) do
-    case PaseoRelay.ConnectionBudget.admit(namespace, limit) do
-      {:ok, token} ->
-        {:ok, token}
+  defp admit({namespace, limit}), do: PaseoRelay.ConnectionBudget.admit(namespace, limit)
 
-      {:error, _reason} = error ->
-        Owner.cancel(owner, reservation)
-        error
+  defp route(connection, options) do
+    case PaseoRelay.Ownership.resolve(connection.server_id) do
+      {:reroute, _target} = decision ->
+        decision
+
+      decision when decision in [:local, :unowned] ->
+        admit_and_route(connection, options)
+    end
+  end
+
+  defp admit_and_route(connection, options) do
+    with {:ok, admission} <- admit(options.connection_budget) do
+      decision =
+        PaseoRelay.Ownership.route(
+          connection.server_id,
+          options.ownership_target,
+          options.config.minimum_cluster_size
+        )
+
+      case decision do
+        {:local, owner, reservation} ->
+          {:local, owner, reservation, admission}
+
+        _not_local ->
+          PaseoRelay.ConnectionBudget.release(admission)
+          decision
+      end
     end
   end
 

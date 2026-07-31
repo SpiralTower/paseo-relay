@@ -117,6 +117,33 @@ defmodule PaseoRelay.RouterIntegrationTest do
     assert response =~ "content-length: 0"
   end
 
+  test "local admission pressure cannot suppress a remote owner reroute" do
+    {peer, peer_node} = start_peer()
+    server_id = "srv_remote_at_capacity_#{System.unique_integer([:positive])}"
+    port = start_listener(PaseoRelay.Config.defaults(), max_websockets: 1)
+    {local_socket, "HTTP/1.1 101" <> _response} = open_websocket(port, "local-capacity-holder")
+
+    on_exit(fn ->
+      :gen_tcp.close(local_socket)
+
+      try do
+        :peer.stop(peer)
+      catch
+        :exit, _ -> :ok
+      end
+    end)
+
+    {:local, _owner, _reservation} =
+      :rpc.call(peer_node, PaseoRelay.Ownership, :route, [server_id, "peer-target"])
+
+    owner = await_owner(server_id)
+    assert node(owner) == peer_node
+
+    response = request(port, "/ws?serverId=#{server_id}&role=client&v=2", websocket_headers())
+    assert "HTTP/1.1 409" <> _ = response
+    assert response =~ "x-reroute-target: peer-target"
+  end
+
   test "metrics exposes local names and values", %{port: port} do
     before = PaseoRelay.Metrics.snapshot()
     {socket, _response} = open_websocket(port, "srv_metrics")
@@ -248,17 +275,19 @@ defmodule PaseoRelay.RouterIntegrationTest do
     end
   end
 
-  defp start_listener(config) do
+  defp start_listener(config, options \\ []) do
     reference = {:router_integration_configured, System.unique_integer([:positive])}
 
     start_supervised!(
       {PaseoRelay.Listener,
-       ref: reference,
-       config: config,
-       ip: {127, 0, 0, 1},
-       port: 0,
-       acceptors: 4,
-       max_connections: 1_000}
+       [
+         ref: reference,
+         config: config,
+         ip: {127, 0, 0, 1},
+         port: 0,
+         acceptors: 4,
+         max_connections: 1_000
+       ] ++ options}
     )
 
     PaseoRelay.Listener.port(reference)

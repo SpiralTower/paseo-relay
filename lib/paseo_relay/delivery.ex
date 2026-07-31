@@ -3,10 +3,9 @@ defmodule PaseoRelay.Delivery do
 
   alias PaseoRelay.Delivery.Writer
 
-  def deliver([], _opcode, _payload, _timeout), do: :ok
+  def deliver([], _opcode, _payload, _deadline), do: :ok
 
-  def deliver(writers, opcode, payload, timeout) do
-    deadline = System.monotonic_time(:millisecond) + timeout
+  def deliver(writers, opcode, payload, deadline) do
     bytes = byte_size(payload)
     deliver_to_writers(writers, bytes, deadline, opcode, payload)
   end
@@ -16,7 +15,7 @@ defmodule PaseoRelay.Delivery do
       Enum.map(writers, fn writer ->
         Task.async(fn ->
           with {:ok, token} <- Writer.reserve(writer, bytes, deadline) do
-            Writer.write(writer, token, opcode, payload)
+            Writer.write(writer, token, opcode, payload, deadline)
           end
         end)
       end)

@@ -66,7 +66,9 @@ monitoring after abnormal death.
 Ranch's own connection accounting is not this safety boundary: Cowboy removes
 an upgraded connection from Ranch accounting at WebSocket takeover. Ranch
 limits only concurrent pre-upgrade HTTP handling and applies TCP backlog
-pressure there. The relay adds no application queue for over-capacity upgrades;
+pressure there. Pre-upgrade HTTP parsing and unread request bodies have a
+15-second idle deadline; upgraded WebSockets keep their protocol-level infinite
+idle lifetime. The relay adds no application queue for over-capacity upgrades;
 an explicit retryable rejection is safer than retaining another socket and
 hiding overload as a timeout.
 
@@ -131,8 +133,9 @@ with room for the configured ingress budget and VM overhead.
   slow-consumer closes is actionable.
 - **A control destination stops reading:** all control notifications use that
   destination's Writer. Once its bounded control queue fills, the control socket
-  receives retryable `1013`; notifications cannot accumulate in an unbounded
-  WebSocket mailbox.
+  receives retryable `1013`; an accepted queued notification that reaches its
+  absolute deadline also closes the destination instead of disappearing.
+  Notifications cannot accumulate in an unbounded WebSocket mailbox.
 - **Ingress reaches the node budget:** every complete message Cowboy delivers
   receives a token before protocol dispatch. Frames already buffered when source
   reads are suspended are separately tokenized and retained in source order. One
@@ -146,17 +149,27 @@ with room for the configured ingress budget and VM overhead.
   retryable `1013`; `paseo_relay_ingress_reserved_bytes` never exceeds the
   ceiling.
 
+  Known remote owners are rerouted without consuming local capacity. For local
+  or unowned sessions, connection admission is acquired before reserving or
+  creating an Owner, so a capacity or pressure rejection cannot leave transient
+  session state behind. Pre-upgrade HTTP parsing and unread request bodies have
+  a finite idle lifetime; upgraded WebSockets explicitly retain an infinite
+  protocol idle timeout and rely on their application lifecycle instead.
+
   The masked client data-frame wire ceiling remains exactly 32 MiB, so Cowboy
   bounds each complete or reassembled fragmented message to `32 MiB - 14 bytes`
   and sends `1009` for one byte more. Inbound v2 control input is limited to
   64 KiB, charged through JSON parsing, and oversized input receives `1009`.
   Incomplete fragments have not crossed the application boundary, so Cowboy's
   message ceiling, the per-WebSocket heap fuse, and the node memory watermark
-  protect them instead. Pressure sheds the oldest blocked delivery first, then
-  the oldest active socket—including one assembling an incomplete message—with
-  `1013` until pressure falls. The generic watermark is disabled because the
-  safe threshold depends on the runtime limit; a strict generic deployment must
-  set a nonzero threshold. The 2 GB Fly template enables it at 1.5 GB.
+  protect them instead. A pressure episode pauses new connection and message
+  admission, sheds the oldest blocked delivery first and then the newest active
+  sockets as a conservative proxy for recent fragment retention, and sizes
+  subsequent bounded batches from measured BEAM memory relief. Admission
+  resumes only below a one-maximum-message hysteresis threshold. The generic
+  watermark is disabled because the safe threshold depends on the runtime
+  limit; a strict generic deployment must set a nonzero threshold. The 2 GB Fly
+  template enables it at 1.5 GB.
 - **Two nodes concurrently claim a previously unowned `serverId`:** Syn favors
   availability, so both WebSockets can initially open against different local
   owners. Conflict resolution keeps one owner and closes sockets on the loser

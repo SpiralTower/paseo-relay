@@ -26,8 +26,9 @@ scripts/ci.sh
 
 `scripts/ci.sh` is the authoritative merge gate. It runs the complete test and
 release matrix, builds every Docker surface, boots the release and both relay
-containers through `/health` and `/ready`, and runs bounded real-WebSocket
-sustained, reconnect, and ownership smoke against the generic production image.
+containers through `/health` and `/ready`, restarts the generic artifact, and
+runs bounded real-WebSocket sustained, concurrent reconnect, and ownership smoke
+against the generic production image.
 
 See [LICENSE](LICENSE).
 
@@ -47,6 +48,7 @@ generic:
 | `PASEO_RELAY_MIN_CLUSTER_SIZE` | `1` | Minimum nodes required before accepting unowned sessions. |
 | `PASEO_RELAY_ACCEPTORS` | `100` | Listener acceptor processes. |
 | `PASEO_RELAY_CONNECTIONS_PER_ACCEPTOR` | `200` | Capacity factor multiplied by the acceptor count to set the node-local active-WebSocket ceiling; the default is 20,000. |
+| `PASEO_RELAY_HTTP_IDLE_TIMEOUT_MS` | `15000` | Maximum idle time for pre-upgrade HTTP parsing and unread request bodies. Upgraded WebSockets remain exempt. |
 | `PASEO_RELAY_INGRESS_BUDGET_BYTES` | `536870912` | Node-wide weighted ceiling for complete WebSocket messages admitted to relay delivery. Must admit one maximum message at the configured weight. |
 | `PASEO_RELAY_INGRESS_WEIGHT` | `4` | Conservative memory weight charged per wire payload byte. |
 | `PASEO_RELAY_DELIVERY_TIMEOUT_MS` | `30000` | Maximum Writer reservation/write-barrier wait before a slow destination is shed. |
@@ -55,7 +57,7 @@ generic:
 | `PASEO_RELAY_DATA_ATTACH_TIMEOUT_MS` | `15000` | Maximum time a v2 client frame waits for its daemon-data socket. |
 | `PASEO_RELAY_TCP_RECEIVE_BUFFER_BYTES` | `65536` | Per-socket TCP receive buffer. |
 | `PASEO_RELAY_WEBSOCKET_MAX_HEAP_WORDS` | `33554432` | Per-WebSocket BEAM heap fuse, including shared binaries. Values below this protocol-safe floor are rejected. |
-| `PASEO_RELAY_MEMORY_WATERMARK_BYTES` | `0` | Optional BEAM total-memory watermark that closes the oldest backpressured source with `1013`; disabled generically because the safe threshold depends on the deployment memory limit. |
+| `PASEO_RELAY_MEMORY_WATERMARK_BYTES` | `0` | Optional BEAM total-memory watermark that pauses admission and sheds WebSockets with `1013` until measured memory reaches the recovery threshold; disabled generically because the safe threshold depends on the deployment memory limit. |
 | `RELEASE_NODE` / `RELEASE_COOKIE` | unset | Standard distributed-release identity. |
 
 `GET /health` is a liveness probe. `GET /ready` returns `200` only while the
@@ -70,8 +72,12 @@ stores topology metadata only, and every destination has a Writer allowing one
 payload write at a time. During delivery Cowboy's native `{active, false}`
 flow control suspends source reads while the WebSocket process remains available
 for full-duplex writes; the source is rearmed only after the destination's
-synchronous HTTP/1 send barrier. Kernel TCP pressure therefore reaches the
-producer without deadlocking simultaneous opposite-direction traffic. Cowboy
+synchronous HTTP/1 send barrier. One absolute delivery deadline includes Owner
+lookup, destination attachment, Writer reservation, and the send barrier;
+accepted control notifications are either written within their deadline or
+close the destination with retryable `1013`. Kernel TCP pressure therefore
+reaches the producer without deadlocking simultaneous opposite-direction
+traffic. Cowboy
 may finish parsing frames already buffered before suspension, so every completed
 message receives an explicit token from one node-local capacity ledger and is
 queued in source order. The same ledger owns connection slots, weighted retained

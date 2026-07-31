@@ -6,7 +6,8 @@ defmodule PaseoRelay.Capacity do
   @reservation_timeout_ms 5_000
   @check_interval_ms 1_000
   @pressure_recheck_ms 100
-  @max_shed_batch 64
+  @initial_max_shed_batch 64
+  @max_shed_batch 1_024
 
   def start_link(config), do: GenServer.start_link(__MODULE__, config, name: __MODULE__)
 
@@ -53,6 +54,7 @@ defmodule PaseoRelay.Capacity do
        reserved_bytes: 0,
        inflight_bytes: 0,
        blocked_sources: 0,
+       pressure: nil,
        pressure_recheck?: false
      }}
   end
@@ -62,6 +64,9 @@ defmodule PaseoRelay.Capacity do
     namespace_state = Map.get(state.namespaces, namespace, %{limit: limit, active: 0})
 
     cond do
+      state.pressure != nil ->
+        {:reply, {:error, :pressure}, state}
+
       namespace_state.limit != limit ->
         {:reply, {:error, :configuration_mismatch}, state}
 
@@ -134,6 +139,9 @@ defmodule PaseoRelay.Capacity do
 
       state.sockets[socket].shedding ->
         {:reply, {:error, :closed}, state}
+
+      state.pressure != nil ->
+        {:reply, {:error, :pressure}, state}
 
       weighted_bytes > state.ingress_limit ->
         {:reply, {:error, :message_exceeds_budget}, state}
@@ -208,6 +216,9 @@ defmodule PaseoRelay.Capacity do
     do: {:reply, state.blocked_sources, state}
 
   def handle_call(:check_now, _from, state), do: {:reply, :ok, shed_if_needed(state)}
+
+  def handle_call({:set_watermark, 0}, _from, state),
+    do: {:reply, :ok, %{state | watermark: 0, pressure: nil}}
 
   def handle_call({:set_watermark, bytes}, _from, state),
     do: {:reply, :ok, %{state | watermark: bytes}}
@@ -364,37 +375,76 @@ defmodule PaseoRelay.Capacity do
 
   defp shed_if_needed(state) do
     memory = :erlang.memory(:total)
+    recovery = recovery_threshold(state.watermark)
 
-    if state.watermark > 0 and memory >= state.watermark do
-      maximum_message = PaseoRelay.Protocol.maximum_message_payload_bytes()
+    cond do
+      state.watermark == 0 ->
+        %{state | pressure: nil}
 
-      batch_size =
-        memory
-        |> Kernel.-(state.watermark)
-        |> Kernel.+(maximum_message - 1)
-        |> div(maximum_message)
-        |> max(1)
-        |> min(@max_shed_batch)
+      state.pressure != nil and memory <= recovery ->
+        %{state | pressure: nil}
 
-      state
-      |> shed_candidates(batch_size)
-      |> schedule_pressure_recheck()
-    else
-      state
+      memory >= state.watermark or state.pressure != nil ->
+        batch_size = pressure_batch(state.pressure, memory, recovery, state.watermark)
+        {state, victims} = shed_candidates(state, batch_size, 0)
+
+        state
+        |> Map.put(:pressure, %{memory: memory, victims: victims, batch: batch_size})
+        |> schedule_pressure_recheck()
+
+      true ->
+        state
     end
   end
 
-  defp shed_candidates(state, 0), do: state
+  defp pressure_batch(nil, memory, _recovery, watermark) do
+    maximum_message = PaseoRelay.Protocol.maximum_message_payload_bytes()
 
-  defp shed_candidates(state, remaining) do
+    memory
+    |> Kernel.-(watermark)
+    |> Kernel.+(maximum_message - 1)
+    |> div(maximum_message)
+    |> max(1)
+    |> min(@initial_max_shed_batch)
+  end
+
+  defp pressure_batch(previous, memory, recovery, _watermark) do
+    relief = previous.memory - memory
+
+    if relief > 0 and previous.victims > 0 do
+      bytes_per_victim = max(div(relief, previous.victims), 1)
+
+      memory
+      |> Kernel.-(recovery)
+      |> Kernel.+(bytes_per_victim - 1)
+      |> div(bytes_per_victim)
+      |> max(1)
+      |> min(@max_shed_batch)
+    else
+      previous.batch
+      |> Kernel.*(2)
+      |> max(1)
+      |> min(@max_shed_batch)
+    end
+  end
+
+  defp recovery_threshold(0), do: 0
+
+  defp recovery_threshold(watermark) do
+    max(watermark - PaseoRelay.Protocol.maximum_message_payload_bytes(), 0)
+  end
+
+  defp shed_candidates(state, 0, victims), do: {state, victims}
+
+  defp shed_candidates(state, remaining, victims) do
     case next_candidate(state) do
       {:ok, socket, state} ->
         send(socket, :relay_memory_pressure)
         PaseoRelay.Metrics.inc(:memory_pressure_disconnects)
-        shed_candidates(state, remaining - 1)
+        shed_candidates(state, remaining - 1, victims + 1)
 
       :empty ->
-        state
+        {state, victims}
     end
   end
 
@@ -412,7 +462,7 @@ defmodule PaseoRelay.Capacity do
   defp next_candidate(state) do
     cond do
       not :gb_trees.is_empty(state.blocked) -> pop_oldest(state.blocked, :blocked, state)
-      not :gb_trees.is_empty(state.active) -> pop_oldest(state.active, :active, state)
+      not :gb_trees.is_empty(state.active) -> pop_newest(state.active, state)
       true -> :empty
     end
   end
@@ -430,6 +480,24 @@ defmodule PaseoRelay.Capacity do
             socket_state
             | active_key: nil,
               blocked_key: nil,
+              shedding: true
+          })
+    }
+
+    {:ok, socket, state}
+  end
+
+  defp pop_newest(tree, state) do
+    {_key, socket} = :gb_trees.largest(tree)
+    socket_state = state.sockets[socket]
+
+    state = %{
+      state
+      | active: delete_key(state.active, socket_state.active_key),
+        sockets:
+          Map.put(state.sockets, socket, %{
+            socket_state
+            | active_key: nil,
               shedding: true
           })
     }

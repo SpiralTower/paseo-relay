@@ -541,3 +541,43 @@
   exited 0; `git diff --check` exited 0; and
   `MIX_ENV=prod asdf exec mix release --overwrite` assembled
   `paseo_relay-0.1.0` successfully. The release was not started or deployed.
+
+## Final admission, deadline, and pressure boundaries
+
+- HTTP lease red/green: with one Ranch connection slot, a `POST /health` that
+  declared but withheld its body kept the next health request blocked when the
+  protocol idle timeout was infinite. A finite pre-upgrade HTTP idle timeout now
+  releases that slot, while a real upgraded WebSocket remains alive beyond the
+  same interval and answers ping with pong.
+- Ownership admission red/green: a valid upgrade rejected at the WebSocket
+  ceiling previously created an Owner before admission and left its `serverId`
+  registered during the grace period. Local capacity is now leased before
+  reserving or creating an Owner, and a real rejected upgrade leaves its unique
+  `serverId` unowned. A second red showed that admitting before even looking up
+  ownership made a full landing node return `503` for a healthy remote session;
+  known remote owners now retain their `409` reroute path without consuming a
+  local slot.
+- Absolute deadline red/green: suspending an alive, fully attached Owner made a
+  real source delivery wait forever before the Writer deadline began. The source
+  now carries one deadline through Owner lookup, data attachment, Writer
+  reservation, and the transport write barrier; the real source closes with
+  `1013 Delivery unavailable` and every capacity gauge returns to zero.
+- Accepted-control red/green: an accepted control notification queued behind a
+  blocked Writer could expire and disappear while its socket stayed healthy.
+  Controlled Writer and Cowboy scheduling over a real control WebSocket now
+  proves the accepted notification is either written before its deadline or
+  closes the destination with `1013 Slow consumer`.
+- Measured-pressure red/green: after older idle sockets and newer real sockets
+  retained incomplete 8 MiB fragments, the previous one-shot estimate admitted
+  replacement work before demonstrating relief. A pressure episode now rejects
+  new upgrades, prioritizes known blocked deliveries, conservatively chooses
+  newest unclassified sockets, and repeats bounded batches based on measured
+  BEAM memory until hysteresis recovery. The fragment source closes with `1013`,
+  an older idle socket remains responsive, and admission reopens only after
+  measured relief.
+- Artifact-restart gate: the mandatory CI path now restarts the built generic
+  production container after sustained traffic, re-probes its exact health,
+  readiness, and metrics contracts, and then opens the bounded 151-socket
+  reconnect wave. This covers boot-after-restart plus concurrent real-WebSocket
+  behavior without moving the documented 23,000-socket staging gate into every
+  pull request.

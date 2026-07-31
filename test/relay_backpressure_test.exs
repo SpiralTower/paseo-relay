@@ -109,6 +109,33 @@ defmodule PaseoRelay.BackpressureTest do
     await_metric(:active_websockets, &(&1 == 0))
   end
 
+  test "an alive but stalled Owner cannot retain a source past its delivery deadline" do
+    port = start_relay(delivery_timeout: 200, data_attach_timeout: 1_000)
+    server_id = "stalled-owner-#{port}"
+    source = raw_connect(port, "/ws?serverId=#{server_id}&role=client&v=2&connectionId=shared")
+
+    destination =
+      raw_connect(port, "/ws?serverId=#{server_id}&role=server&v=2&connectionId=shared")
+
+    assert :ok = send_frame(source, :text, "owner-ready")
+    assert {:text, "owner-ready"} = recv_server_frame(destination)
+    owner = PaseoRelay.Ownership.owner_pid(server_id)
+    :ok = :sys.suspend(owner)
+
+    on_exit(fn ->
+      if Process.alive?(owner), do: :sys.resume(owner)
+    end)
+
+    assert :ok = send_frame(source, :text, "bounded-owner-lookup")
+    assert {:close, 1013, "Delivery unavailable"} = recv_until_close(source)
+    await_reserved(&(&1 == 0))
+    await_metric(:backpressured_sources, &(&1 == 0))
+    await_metric(:inflight_delivery_bytes, &(&1 == 0))
+    close_raw(source)
+    close_raw_websocket(destination)
+    await_metric(:active_websockets, &(&1 == 0))
+  end
+
   @tag timeout: 20_000
   test "a passive destination bounds relay payloads and stalls the source TCP sender" do
     port = start_relay(delivery_timeout: 500, send_timeout: 1_000)
@@ -396,6 +423,44 @@ defmodule PaseoRelay.BackpressureTest do
     await_metric(:active_websockets, &(&1 == active_baseline))
   end
 
+  @tag timeout: 15_000
+  test "an accepted control notification cannot expire silently in the Writer queue" do
+    existing_writers = writer_processes()
+    port = start_relay(delivery_timeout: 1_000, control_queue: 1024 * 1024)
+    server_id = "control-deadline-#{port}"
+    control = raw_connect(port, "/ws?serverId=#{server_id}&role=server&v=2")
+    assert {:text, _sync} = recv_server_frame(control)
+    writer = await_new_writer(existing_writers)
+    [control_process] = ranch_connections(port)
+    :erlang.suspend_process(control_process)
+
+    on_exit(fn -> resume_process(control_process) end)
+
+    assert :ok = PaseoRelay.Delivery.Writer.control(writer, ~s({"type":"connected","id":"first"}))
+
+    assert :ok =
+             PaseoRelay.Delivery.Writer.control(writer, ~s({"type":"connected","id":"second"}))
+
+    :ok = :sys.suspend(writer)
+
+    on_exit(fn ->
+      if Process.alive?(writer), do: :sys.resume(writer)
+    end)
+
+    resume_process(control_process)
+
+    receive do
+    after
+      1_100 -> :ok
+    end
+
+    :ok = :sys.resume(writer)
+    close = Task.async(fn -> recv_until_close(control) end)
+    assert {:close, 1013, "Slow consumer"} = Task.await(close, 2_000)
+    close_raw(control)
+    await_metric(:active_websockets, &(&1 == 0))
+  end
+
   @tag timeout: 60_000
   test "an unread control socket is shed through its bounded Writer" do
     port =
@@ -551,6 +616,74 @@ defmodule PaseoRelay.BackpressureTest do
     assert {:close, 1013, "Relay memory pressure"} = recv_until_close(source)
     await_metric(:active_websockets, &(&1 == baseline))
     await_reserved(&(&1 == reserved))
+  end
+
+  @tag timeout: 30_000
+  test "a pressure episode pauses admission and measures relief from fragment sources" do
+    on_exit(fn -> reconfigure_pressure(0) end)
+    port = start_relay()
+
+    idle =
+      Enum.map(1..3, fn index ->
+        raw_connect(port, "/ws?serverId=pressure-idle-#{port}-#{index}&role=server")
+      end)
+
+    fragment_connections =
+      Enum.map(1..5, fn index ->
+        existing_connections = MapSet.new(ranch_connections(port))
+
+        source =
+          raw_connect(port, "/ws?serverId=pressure-fragment-#{port}-#{index}&role=server")
+
+        assert :ok =
+                 send_raw_frame(source, 0x2, :binary.copy(<<index>>, 8 * 1024 * 1024), false)
+
+        pong = "retained-#{index}"
+        assert :ok = send_raw_frame(source, 0x9, pong, true)
+        assert {:pong, ^pong} = recv_server_frame(source)
+
+        [connection_process] =
+          port
+          |> ranch_connections()
+          |> MapSet.new()
+          |> MapSet.difference(existing_connections)
+          |> MapSet.to_list()
+
+        {source, connection_process}
+      end)
+
+    fragments = Enum.map(fragment_connections, &elem(&1, 0))
+    {_newest_fragment, newest_process} = List.last(fragment_connections)
+    :erlang.suspend_process(newest_process)
+    on_exit(fn -> resume_process(newest_process) end)
+
+    :erlang.garbage_collect(self())
+    watermark = :erlang.memory(:total) - 16 * 1024 * 1024
+    assert watermark > PaseoRelay.Protocol.maximum_message_payload_bytes()
+    reconfigure_pressure(watermark)
+    assert :ok = PaseoRelay.Delivery.Pressure.check_now()
+
+    {:ok, rejected, response} =
+      upgrade_once(port, "/ws?serverId=pressure-paused-#{port}&role=server")
+
+    track({:socket, rejected})
+    assert response =~ "HTTP/1.1 503 Service Unavailable"
+    assert response =~ "Relay memory pressure"
+    close_raw(rejected)
+
+    resume_process(newest_process)
+    assert {:close, 1013, "Relay memory pressure"} = recv_until_close(List.last(fragments))
+
+    replacement =
+      reconnect_after_pressure(port, "/ws?serverId=pressure-resumed-#{port}&role=server")
+
+    :ok = send_raw_frame(hd(idle), 0x9, "idle-survived", true)
+    assert {:pong, "idle-survived"} = recv_server_frame(hd(idle))
+
+    close_raw_websocket(replacement)
+    Enum.each(idle, &close_raw_websocket/1)
+    Enum.each(fragments, &close_raw/1)
+    await_metric(:active_websockets, &(&1 == 0))
   end
 
   test "a capacity restart drains retained payloads before production admission reopens" do
@@ -923,6 +1056,26 @@ defmodule PaseoRelay.BackpressureTest do
     |> MapSet.new()
   end
 
+  defp ranch_connections(port) do
+    reference =
+      :ranch.info()
+      |> Enum.find_value(fn {reference, info} ->
+        if info.port == port, do: reference
+      end)
+
+    :ranch.procs(reference, :connections)
+  end
+
+  defp resume_process(process) do
+    if Process.alive?(process) do
+      try do
+        :erlang.resume_process(process)
+      catch
+        :error, :badarg -> :ok
+      end
+    end
+  end
+
   defp await_new_writer(existing) do
     deadline = System.monotonic_time(:millisecond) + 2_000
     await_new_writer(existing, deadline)
@@ -1027,6 +1180,34 @@ defmodule PaseoRelay.BackpressureTest do
 
     Process.sleep(10)
     reconnect_until_up(port, path, old_connection, deadline)
+  end
+
+  defp reconnect_after_pressure(port, path) do
+    reconnect_after_pressure(port, path, System.monotonic_time(:millisecond) + 5_000)
+  end
+
+  defp reconnect_after_pressure(port, path, deadline) do
+    case upgrade_once(port, path) do
+      {:ok, socket, "HTTP/1.1 101" <> _response} ->
+        track({:socket, socket})
+        socket
+
+      {:ok, socket, _response} ->
+        :gen_tcp.close(socket)
+        retry_after_pressure(port, path, deadline)
+
+      {:error, _reason} ->
+        retry_after_pressure(port, path, deadline)
+    end
+  end
+
+  defp retry_after_pressure(port, path, deadline) do
+    if System.monotonic_time(:millisecond) >= deadline do
+      flunk("capacity admission did not reopen after measured memory recovery")
+    end
+
+    Process.sleep(10)
+    reconnect_after_pressure(port, path, deadline)
   end
 
   defp close_raw(socket) do

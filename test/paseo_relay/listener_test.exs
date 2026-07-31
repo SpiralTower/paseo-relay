@@ -35,6 +35,52 @@ defmodule PaseoRelay.ListenerTest do
     assert response =~ ~s({"status":"ok"})
   end
 
+  test "a stalled HTTP body releases its listener slot without expiring WebSockets" do
+    listener = {:listener_http_idle, System.unique_integer([:positive])}
+
+    start_supervised!(
+      {PaseoRelay.Listener,
+       ref: listener,
+       config: PaseoRelay.Config.defaults(),
+       ip: {127, 0, 0, 1},
+       port: 0,
+       acceptors: 1,
+       connection_supervisors: 1,
+       max_connections: 1,
+       http_idle_timeout_ms: 100}
+    )
+
+    port = PaseoRelay.Listener.port(listener)
+    {:ok, stalled} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false])
+
+    on_exit(fn ->
+      :gen_tcp.close(stalled)
+    end)
+
+    :ok =
+      :gen_tcp.send(
+        stalled,
+        "POST /health HTTP/1.1\r\nHost: relay.test\r\nContent-Length: 1\r\n\r\n"
+      )
+
+    assert {:ok, stalled_response} = :gen_tcp.recv(stalled, 0, 2_000)
+    assert stalled_response =~ "HTTP/1.1 200 OK"
+
+    {:ok, health} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false])
+    on_exit(fn -> :gen_tcp.close(health) end)
+    :ok = :gen_tcp.send(health, "GET /health HTTP/1.1\r\nHost: relay.test\r\n\r\n")
+    assert {:ok, response} = :gen_tcp.recv(health, 0, 2_000)
+    assert response =~ "HTTP/1.1 200 OK"
+    :ok = :gen_tcp.close(health)
+
+    websocket = open_websocket(port, "http-timeout-websocket")
+    on_exit(fn -> :gen_tcp.close(websocket) end)
+    assert {:text, _sync} = recv_server_frame(websocket)
+    Process.sleep(200)
+    :ok = :gen_tcp.send(websocket, :cow_ws.masked_frame({:ping, "alive"}, 0x10203040))
+    assert {:pong, "alive"} = recv_server_frame(websocket)
+  end
+
   test "the active WebSocket ceiling rejects exactly at capacity and releases on close" do
     reference = {:listener_budget, System.unique_integer([:positive])}
     rejections = PaseoRelay.Metrics.value(:connection_rejections)
@@ -51,22 +97,24 @@ defmodule PaseoRelay.ListenerTest do
     )
 
     port = PaseoRelay.Listener.port(reference)
+    rejected_server_id = "budget-third-#{System.unique_integer([:positive])}"
     first = open_websocket(port, "budget-first")
     second = open_websocket(port, "budget-second")
 
     assert PaseoRelay.ConnectionBudget.active(reference) == 2
 
-    rejected = connect_and_request_websocket(port, "budget-third")
+    rejected = connect_and_request_websocket(port, rejected_server_id)
     assert {:ok, response} = :gen_tcp.recv(rejected, 0, 2_000)
     assert response =~ "HTTP/1.1 503 Service Unavailable"
     assert response =~ "Relay connection capacity"
     assert PaseoRelay.Metrics.value(:connection_rejections) == rejections + 1
+    assert PaseoRelay.Ownership.resolve(rejected_server_id) == :unowned
     :ok = :gen_tcp.close(rejected)
 
     :ok = :gen_tcp.close(first)
     assert_eventually(fn -> PaseoRelay.ConnectionBudget.active(reference) == 1 end)
 
-    replacement = open_websocket(port, "budget-third")
+    replacement = open_websocket(port, rejected_server_id)
     assert PaseoRelay.ConnectionBudget.active(reference) == 2
 
     :ok = :gen_tcp.close(second)
@@ -177,6 +225,7 @@ defmodule PaseoRelay.ListenerTest do
     second = open_websocket(port, "pressure-batch-second")
     padding = :binary.copy(<<0x4D>>, 40 * 1024 * 1024)
     maximum_message = PaseoRelay.Protocol.maximum_message_payload_bytes()
+    :erlang.garbage_collect(self())
     watermark = :erlang.memory(:total) - maximum_message - 1
     assert watermark > 0
 
@@ -245,6 +294,7 @@ defmodule PaseoRelay.ListenerTest do
       {0x8, <<code::16, reason::binary>>} -> {:close, code, reason}
       {0x1, payload} -> {:text, payload}
       {0x2, payload} -> {:binary, payload}
+      {0xA, payload} -> {:pong, payload}
     end
   end
 

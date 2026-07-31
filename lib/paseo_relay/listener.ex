@@ -75,7 +75,7 @@ defmodule PaseoRelay.Listener do
 
     %{
       env: %{dispatch: dispatch},
-      idle_timeout: :infinity,
+      idle_timeout: Keyword.get(options, :http_idle_timeout_ms, config.http_idle_timeout_ms),
       protocols: [:http]
     }
   end

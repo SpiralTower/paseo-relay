@@ -32,15 +32,20 @@ defmodule PaseoRelay.ConfigTest do
   end
 
   test "loads and validates the listener ceiling as connections per acceptor" do
-    assert {:ok, %{acceptors: 20, connections_per_acceptor: 750}} =
+    assert {:ok, %{acceptors: 20, connections_per_acceptor: 750, http_idle_timeout_ms: 10_000}} =
              Config.load([
                {"PASEO_RELAY_ACCEPTORS", "20"},
-               {"PASEO_RELAY_CONNECTIONS_PER_ACCEPTOR", "750"}
+               {"PASEO_RELAY_CONNECTIONS_PER_ACCEPTOR", "750"},
+               {"PASEO_RELAY_HTTP_IDLE_TIMEOUT_MS", "10000"}
              ])
 
     assert Config.load([{"PASEO_RELAY_CONNECTIONS_PER_ACCEPTOR", "0"}]) ==
              {:error,
               "PASEO_RELAY_CONNECTIONS_PER_ACCEPTOR must be an integer between 1 and 1000000"}
+
+    assert Config.load([{"PASEO_RELAY_HTTP_IDLE_TIMEOUT_MS", "0"}]) ==
+             {:error,
+              "PASEO_RELAY_HTTP_IDLE_TIMEOUT_MS must be an integer between 100 and 120000"}
   end
 
   test "validates the weighted ingress envelope and delivery limits" do

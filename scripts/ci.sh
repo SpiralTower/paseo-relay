@@ -83,6 +83,14 @@ node scripts/relay-load.mjs \
   --endpoints "ws://127.0.0.1:${container_port}/ws" \
   --scenario sustained --pairs 25 --batch-size 25 --rate 20 --duration 2 \
   --cleanup-grace 5 --drain-timeout 5
+
+docker restart "${generic_container}" >/dev/null
+if ! wait_for_endpoint "http://127.0.0.1:${container_port}/health"; then
+  docker logs "${generic_container}" >&2
+  exit 1
+fi
+assert_operations_contract "http://127.0.0.1:${container_port}"
+
 node scripts/relay-load.mjs \
   --endpoints "ws://127.0.0.1:${container_port}/ws" \
   --scenario reconnect --pairs 25 --batch-size 25 --reconnects 2 --duration 1 \
