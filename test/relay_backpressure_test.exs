@@ -408,6 +408,7 @@ defmodule PaseoRelay.BackpressureTest do
 
     server_id = "slow-control-#{port}"
     active_baseline = PaseoRelay.Metrics.value(:active_websockets)
+    control = raw_connect(port, "/ws?serverId=#{server_id}&role=server&v=2")
 
     clients =
       Enum.map(1..1_000, fn index ->
@@ -418,8 +419,6 @@ defmodule PaseoRelay.BackpressureTest do
           "/ws?serverId=#{server_id}&role=client&v=2&connectionId=#{connection_id}"
         )
       end)
-
-    control = raw_connect(port, "/ws?serverId=#{server_id}&role=server&v=2")
 
     resources = Process.get(:relay_test_resources)
 

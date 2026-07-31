@@ -209,6 +209,14 @@
   runs after the correction; the post-correction complete suite passed 73/73 in
   97.5 seconds with formatting, warnings-as-errors compilation, and lock
   validation green.
+- The next clean Linux run closed the unread-control test with `1012 Session
+  expired` before its target scenario: constructing 1,000 existing session
+  members first exhausted the five-second upgrade reservation under runner
+  scheduling. The test now establishes the unread control socket first and then
+  fills its real transport with the same notification wave, isolating bounded
+  Writer shedding from session-upgrade latency. The focused regression passed
+  four consecutive local runs, followed by a 73/73 complete-suite pass in 98.7
+  seconds.
 
 ### Final standards architectural audit
 
