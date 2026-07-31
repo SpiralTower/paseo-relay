@@ -161,6 +161,43 @@
   path. The two remaining ignored Cowlib advisories concern unused client-side
   cookie encoding and invalid response-header construction rejected by Cowboy,
   as documented beside the existing allowlist in `mix.exs`.
+- Second review-cycle red: a real v2 control socket accepted and decoded a
+  64 KiB+1 text message instead of rejecting it before JSON allocation. A real
+  Cowboy socket killed by its configured max-heap fuse during an active delivery
+  returned the active-WebSocket and ingress gauges to zero but permanently left
+  one backpressured source and seven in-flight bytes. Killing the old ingress
+  singleton also allowed its empty replacement to exist while old connections
+  were still closing.
+- Green: `PaseoRelay.Capacity` is now the single monitored ledger for connection
+  reservations, attached sockets, explicit per-message tokens, retained bytes,
+  delivery transitions, pressure order, and all four transient gauges. The
+  heap-fuse boundary returns every gauge to baseline without running
+  `Socket.terminate/3`. A 64 KiB Cowboy control ceiling returns `1009` before
+  parsing, while supported control messages enter the same ledger as data.
+  Capacity and the production Ranch listener run under `:rest_for_one`; a real
+  retained-payload restart test observes the old listener terminate before
+  replacement admission succeeds.
+- Hosted-CI red: the global-count reconnect assertion included unrelated Owners
+  that expired during its 1,000-server wave, and later peer tests could inherit a
+  changed node cookie. The test now preserves the cookie, checks every named
+  surge Owner through Syn on all three real nodes, and waits for the public
+  reroute result before attempting a disjoint-node WebSocket upgrade.
+- Final review red: a queued reservation-expiry message could remove a socket
+  after its reservation had already become active. A socket chosen for pressure
+  shedding could also admit or start pipelined messages before its asynchronous
+  close ran. A separate real-socket red proved one pressure check shed only one
+  of two sockets despite more than one maximum message of memory overshoot.
+  Expiry now applies only to reservation state, and shedding is a terminal
+  ledger state: both new admission and reserved-to-delivering transitions fail
+  closed with token cleanup and an orderly `1013`. Pressure checks shed a batch
+  proportional to current overshoot (capped at 64) and recheck after 100 ms while
+  pressure and eligible sockets remain.
+- The public heap-fuse regression establishes a real 8 MiB delivery to an unread
+  TCP destination, then sends a maximum legal frame in the reverse direction to
+  kill the actual Cowboy process. It passed four consecutive focused runs and
+  reconciled active sockets, retained bytes, in-flight bytes, and blocked sources
+  each time. The final local gate passed formatting, warnings-as-errors test
+  compilation, unused-lock validation, and all 73 tests in 101.2 seconds.
 
 ### Final standards architectural audit
 
@@ -168,20 +205,20 @@
   trees, patch verifier, Plug router, and custom WebSock returns are gone. The
   only server path is public Cowboy/Ranch HTTP/1 with native active-mode flow
   control.
-- Protocol and admission boundary: the 32 MiB masked wire ceiling is derived in
-  one protocol module; completed payload references are bounded by the weighted
-  node budget, per-socket heap fuse, active-WebSocket admission process, and the
-  all-socket node watermark for incomplete assembly. Every budget/pressure
-  process is monitored and failure closes dependent sockets.
+- Protocol and admission boundary: the 32 MiB masked data ceiling and 64 KiB
+  inbound-control ceiling are derived in one protocol module. One capacity
+  ledger owns connection and message admission, delivery state, pressure order,
+  and computed gauges; its socket monitors reconcile forced exits. Ledger loss
+  stops every production listener connection before a fresh epoch admits work.
 - Session and distribution boundary: Owner remains the only session topology
   authority, Syn stores only `serverId` ownership metadata, and the disjoint-node
   test proves reroute before payload exchange. No payload path uses OTP
   distribution or a node-wide Registry.
 - Delivery boundary: Writer is the sole application-frame sender, including
   JSON pong and Owner notifications. Its payload waiters contain metadata only;
-  completed payload references remain in their budgeted source/task owners, and
+  completed payload references remain in their tokenized source/task owners, and
   its control payload queue has an explicit byte cap. Writer, Owner, connection
-  budget, and ingress budget death all fail sockets closed.
+  Owner and capacity-ledger death all fail sockets closed.
 - Configuration and provider boundary: runtime parsing validates one config
   struct, startup passes that struct without duplicated listener defaults, and
   the Writer deadline must precede the transport send timeout. Core code has no

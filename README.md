@@ -73,16 +73,26 @@ for full-duplex writes; the source is rearmed only after the destination's
 synchronous HTTP/1 send barrier. Kernel TCP pressure therefore reaches the
 producer without deadlocking simultaneous opposite-direction traffic. Cowboy
 may finish parsing frames already buffered before suspension, so every completed
-message is charged immediately against the global weighted ingress budget and
-queued in source order. Budget exhaustion closes that source with retryable
-`1013`. The compatible masked client-frame ceiling remains exactly 32 MiB,
-which permits `32 MiB - 14 bytes` of payload. Cowboy applies that payload limit
-to both individual frames and reassembled fragmented messages and closes an
-oversized message with `1009`. Control notifications use the same Writer
+message receives an explicit token from one node-local capacity ledger and is
+queued in source order. The same ledger owns connection slots, weighted retained
+bytes, delivery state, pressure order, and their gauges; a socket monitor, rather
+than its termination callback, releases all tokens after abnormal death. Losing
+the ledger stops the production listener and its existing connections before a
+fresh ledger can reopen admission. Budget exhaustion closes that source with
+retryable `1013`.
+
+The compatible masked data-frame ceiling remains exactly 32 MiB, which permits
+`32 MiB - 14 bytes` of payload. Cowboy applies that payload limit to individual
+frames and reassembled fragmented messages and closes an oversized message with
+`1009`. The only supported inbound v2 control message is the legacy JSON ping;
+control input has a separate 64 KiB Cowboy ceiling and is charged to the same
+ledger through parsing. Outbound control notifications use the same Writer
 boundary with their own bounded byte queue. Because Cowboy exposes incomplete
 fragment assembly only inside its connection process, the configured node
 memory watermark monitors every admitted socket and can shed an assembling
-source before the runtime limit; blocked deliveries are shed first.
+source before the runtime limit; blocked deliveries are shed first. A nonzero
+watermark is required for a strict deployment-wide memory bound, so generic
+operators must set it from their runtime limit.
 
 See [`OPERATIONS.md`](OPERATIONS.md) for the production failure model,
 capacity policy, and alerting signals.

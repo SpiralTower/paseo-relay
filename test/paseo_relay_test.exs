@@ -98,7 +98,7 @@ defmodule PaseoRelay.DistributedOwnershipTest do
         )
     end
 
-    :erlang.set_cookie(node(), :relay_test_cookie)
+    cookie = Node.get_cookie() |> Atom.to_charlist()
 
     {:ok, peer_a, peer_node_a} =
       :peer.start_link(%{
@@ -106,7 +106,7 @@ defmodule PaseoRelay.DistributedOwnershipTest do
         connection: 0,
         args: [
           ~c"-setcookie",
-          ~c"relay_test_cookie",
+          cookie,
           ~c"-connect_all",
           ~c"false",
           ~c"-kernel",
@@ -123,7 +123,7 @@ defmodule PaseoRelay.DistributedOwnershipTest do
         connection: 0,
         args: [
           ~c"-setcookie",
-          ~c"relay_test_cookie",
+          cookie,
           ~c"-connect_all",
           ~c"false",
           ~c"-kernel",
@@ -236,10 +236,12 @@ defmodule PaseoRelay.DistributedOwnershipTest do
     {:ok, server} = connect_role_on(peer_a, port_a, server_id, "server", "shared")
     assert_receive {:partition_open, ^server}
 
+    assert {:reroute, target} =
+             await_resolve(peer_b, server_id, {:reroute, Atom.to_string(peer_a)})
+
     response = websocket_upgrade(port_b, server_id, "client", "shared")
     assert "HTTP/1.1 409" <> _ = response
     assert response =~ "x-reroute-target: #{peer_a}"
-    assert {:reroute, target} = :rpc.call(peer_b, Ownership, :resolve, [server_id])
     assert target == Atom.to_string(peer_a)
 
     {:ok, client} = connect_role_on(peer_a, port_a, server_id, "client", "shared")
@@ -304,7 +306,6 @@ defmodule PaseoRelay.DistributedOwnershipTest do
   } do
     prefix = "surge-#{System.unique_integer([:positive])}"
     observers = [node(), peer_a, peer_b]
-    baseline = registry_counts(observers)
 
     entries =
       [:local, peer_a, peer_b]
@@ -326,8 +327,10 @@ defmodule PaseoRelay.DistributedOwnershipTest do
     assert length(results) == @surge_count
     assert Enum.count(results, &match?({:ok, {:local, _, _}}, &1)) == @surge_count
 
-    expected_counts = expected_registry_counts(baseline, entries)
-    assert expected_counts == await_registry_counts(observers, expected_counts)
+    expected_owners =
+      Map.new(entries, fn {landing, server_id} -> {server_id, landing_node(landing)} end)
+
+    assert expected_owners == await_registry_owners(observers, expected_owners)
 
     observer_by_landing = %{:local => peer_a, peer_a => peer_b, peer_b => node()}
 
@@ -445,55 +448,55 @@ defmodule PaseoRelay.DistributedOwnershipTest do
   defp target_for(:local), do: "local"
   defp target_for(peer), do: Atom.to_string(peer)
 
-  defp expected_registry_counts(baseline, entries) do
-    increments =
-      entries
-      |> Enum.map(fn {landing, _server_id} -> landing_node(landing) end)
-      |> Enum.frequencies()
-
-    Map.new(baseline, fn {{observer, origin}, count} ->
-      {{observer, origin}, count + Map.get(increments, origin, 0)}
-    end)
-  end
-
   defp landing_node(:local), do: node()
   defp landing_node(peer), do: peer
 
-  defp registry_counts(nodes) do
-    Map.new(
-      for observer <- nodes,
-          origin <- nodes,
-          do: {{observer, origin}, registry_count(observer, origin)}
+  defp registry_owners(observer, server_ids) do
+    server_ids
+    |> Task.async_stream(
+      fn server_id -> {server_id, lookup_owner(observer, server_id)} end,
+      max_concurrency: 256,
+      ordered: false,
+      timeout: 5_000
     )
+    |> Map.new(fn {:ok, entry} -> entry end)
   end
 
-  defp registry_count(observer, origin) do
-    if observer == node() do
-      :syn.registry_count(:paseo_relay_owners, origin)
-    else
-      :rpc.call(observer, :syn, :registry_count, [:paseo_relay_owners, origin])
+  defp lookup_owner(observer, server_id) do
+    result =
+      if observer == node(),
+        do: :syn.lookup(:paseo_relay_owners, server_id),
+        else: :rpc.call(observer, :syn, :lookup, [:paseo_relay_owners, server_id])
+
+    case result do
+      {process, _metadata} -> node(process)
+      :undefined -> nil
     end
   end
 
-  defp await_registry_counts(observers, expected) do
+  defp await_registry_owners(observers, expected) do
     deadline = System.monotonic_time(:millisecond) + 30_000
-    await_registry_counts(observers, expected, deadline)
+    await_registry_owners(observers, expected, deadline)
   end
 
-  defp await_registry_counts(observers, expected, deadline) do
-    counts = registry_counts(observers)
+  defp await_registry_owners(observers, expected, deadline) do
+    server_ids = Map.keys(expected)
+    owners = Map.new(observers, &{&1, registry_owners(&1, server_ids)})
 
-    if counts == expected do
-      counts
+    if Enum.all?(owners, fn {_observer, actual} -> actual == expected end) do
+      expected
     else
       if System.monotonic_time(:millisecond) >= deadline do
-        flunk(
-          "Syn registry did not converge: expected #{inspect(expected)}, got #{inspect(counts)}"
-        )
+        mismatches =
+          Map.new(owners, fn {observer, actual} ->
+            {observer, Enum.count(expected, fn {name, owner} -> actual[name] != owner end)}
+          end)
+
+        flunk("Syn registry did not converge: mismatches #{inspect(mismatches)}")
       end
 
-      Process.sleep(10)
-      await_registry_counts(observers, expected, deadline)
+      Process.sleep(100)
+      await_registry_owners(observers, expected, deadline)
     end
   end
 

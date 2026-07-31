@@ -134,22 +134,29 @@ with room for the configured ingress budget and VM overhead.
   receives retryable `1013`; notifications cannot accumulate in an unbounded
   WebSocket mailbox.
 - **Ingress reaches the node budget:** every complete message Cowboy delivers
-  to the relay is charged before relay delivery starts. Frames already buffered
-  when source reads are suspended are also charged and retained in source order.
-  If the weighted total would cross the configured ceiling, that source closes
-  with retryable `1013`; `paseo_relay_ingress_reserved_bytes` never exceeds the
-  ceiling. The masked client-frame wire ceiling remains exactly 32 MiB, so
-  Cowboy bounds each complete or reassembled fragmented message to
-  `32 MiB - 14 bytes` of payload and sends `1009` for one byte more. Bytes
-  belonging to an incomplete fragmented message have not yet crossed the
-  application boundary, so they are protected by Cowboy's message ceiling, the
-  per-WebSocket heap fuse, and the node memory watermark rather than the
-  completed-message budget. The pressure authority monitors every admitted
-  socket, sheds the oldest blocked delivery first, and otherwise closes the
-  oldest active socket—including one assembling an incomplete message—with
+  receives a token before protocol dispatch. Frames already buffered when source
+  reads are suspended are separately tokenized and retained in source order. One
+  monitored capacity ledger owns connection slots, weighted reservations, active
+  deliveries, pressure order, and all related gauges. Socket death atomically
+  drops every token, including after a forced heap-fuse exit. If the ledger dies,
+  the runtime supervisor stops the listener and every old connection before
+  restarting the ledger and reopening admission; this intentionally creates a
+  node-local reconnect wave rather than overlapping accounting epochs. If the
+  weighted total would cross the configured ceiling, that source closes with
+  retryable `1013`; `paseo_relay_ingress_reserved_bytes` never exceeds the
+  ceiling.
+
+  The masked client data-frame wire ceiling remains exactly 32 MiB, so Cowboy
+  bounds each complete or reassembled fragmented message to `32 MiB - 14 bytes`
+  and sends `1009` for one byte more. Inbound v2 control input is limited to
+  64 KiB, charged through JSON parsing, and oversized input receives `1009`.
+  Incomplete fragments have not crossed the application boundary, so Cowboy's
+  message ceiling, the per-WebSocket heap fuse, and the node memory watermark
+  protect them instead. Pressure sheds the oldest blocked delivery first, then
+  the oldest active socket—including one assembling an incomplete message—with
   `1013` until pressure falls. The generic watermark is disabled because the
-  safe threshold depends on the runtime limit; the 2 GB Fly template enables it
-  at 1.5 GB, leaving room for shutdown and reconnect churn.
+  safe threshold depends on the runtime limit; a strict generic deployment must
+  set a nonzero threshold. The 2 GB Fly template enables it at 1.5 GB.
 - **Two nodes concurrently claim a previously unowned `serverId`:** Syn favors
   availability, so both WebSockets can initially open against different local
   owners. Conflict resolution keeps one owner and closes sockets on the loser

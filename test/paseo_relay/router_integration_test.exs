@@ -211,7 +211,7 @@ defmodule PaseoRelay.RouterIntegrationTest do
     {:ok, peer, peer_node} =
       :peer.start_link(%{
         name: :"relay_peer_#{System.unique_integer([:positive])}",
-        cookie: Node.get_cookie()
+        args: [~c"-setcookie", Node.get_cookie() |> Atom.to_charlist()]
       })
 
     :ok = :rpc.call(peer_node, :code, :add_paths, [:code.get_path()])

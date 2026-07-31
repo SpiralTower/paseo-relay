@@ -9,6 +9,7 @@ defmodule PaseoRelay.BackpressureTest do
   @maximum_client_frame_payload_bytes @maximum_frame_wire_bytes -
                                         @maximum_client_frame_header_bytes
   @maximum_message_payload_bytes PaseoRelay.Protocol.maximum_message_payload_bytes()
+  @maximum_control_payload_bytes PaseoRelay.Protocol.maximum_control_payload_bytes()
 
   setup do
     {:ok, resources} = Agent.start(fn -> [] end)
@@ -449,6 +450,61 @@ defmodule PaseoRelay.BackpressureTest do
     assert_receive {:relay_closed, ^socket, {:remote, 1013, "Delivery unavailable"}}, 2_000
   end
 
+  test "an oversized v2 control message is rejected before JSON parsing" do
+    port = start_relay()
+    control = raw_connect(port, "/ws?serverId=control-limit-#{port}&role=server&v=2")
+    payload = :binary.copy(<<0x20>>, @maximum_control_payload_bytes + 1)
+
+    assert :ok = send_frame(control, :text, payload)
+    assert {:close, 1009, _reason} = recv_until_close(control)
+  end
+
+  test "a heap-fuse kill during delivery reconciles every capacity gauge" do
+    low_heap_port =
+      start_relay(
+        websocket_heap_words: 4_194_304,
+        delivery_timeout: 15_000,
+        send_timeout: 20_000,
+        send_buffer: 1024
+      )
+
+    normal_port = start_relay(delivery_timeout: 15_000, send_timeout: 20_000, send_buffer: 1024)
+    baseline = transient_gauges()
+    server_id = "heap-delivery-#{low_heap_port}"
+    slow = raw_connect(normal_port, v2_path(server_id, "client", "shared"))
+    {:ok, healthy} = connect(v2_url(normal_port, server_id, "client", "shared"))
+    assert_receive {:relay_open, ^healthy}
+    source = raw_connect(low_heap_port, v2_path(server_id, "server", "shared"))
+    payload = :binary.copy(<<0x5A>>, 8 * 1024 * 1024)
+
+    sender =
+      Task.async(fn ->
+        Enum.reduce_while(1..32, :ok, fn _, _result ->
+          case send_frame(source, :binary, payload) do
+            :ok -> {:cont, :ok}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+      end)
+
+    await_metric(:backpressured_sources, &(&1 == 1))
+
+    assert :ok =
+             WebSockex.send_frame(
+               healthy,
+               {:binary, :binary.copy(<<0x6B>>, @maximum_client_frame_payload_bytes)}
+             )
+
+    assert :ok = await_transport_close(source)
+    await_metric(:backpressured_sources, &(&1 == 0))
+    await_metric(:inflight_delivery_bytes, &(&1 == 0))
+    _ = Task.await(sender, 5_000)
+
+    close_raw(slow)
+    stop_resource({:client, healthy})
+    await_transient_gauges(baseline)
+  end
+
   test "the node watermark explicitly closes the oldest blocked source" do
     reconfigure_pressure(1)
     on_exit(fn -> reconfigure_pressure(0) end)
@@ -479,6 +535,8 @@ defmodule PaseoRelay.BackpressureTest do
 
     await_metric(:active_websockets, &(&1 == baseline + 1))
     assert :ok = send_raw_frame(source, 0x2, fragment, false)
+    assert :ok = send_raw_frame(source, 0x9, "fragment-retained", true)
+    assert {:pong, "fragment-retained"} = recv_server_frame(source)
     assert :ok = PaseoRelay.Delivery.Pressure.check_now()
 
     assert {:close, 1013, "Relay memory pressure"} = recv_until_close(source)
@@ -486,29 +544,63 @@ defmodule PaseoRelay.BackpressureTest do
     await_reserved(&(&1 == reserved))
   end
 
-  test "an ingress budget restart fails existing Cowboy sockets closed" do
-    port = start_relay()
+  test "a capacity restart drains retained payloads before production admission reopens" do
+    port = PaseoRelay.Listener.port(PaseoRelay.Listener)
     baseline = PaseoRelay.Metrics.value(:active_websockets)
-    {:ok, socket} = connect("ws://127.0.0.1:#{port}/ws?serverId=budget-death-#{port}&role=server")
-    assert_receive {:relay_open, ^socket}
+
+    socket =
+      raw_connect(port, "/ws?serverId=budget-death-#{port}&role=client&v=2&connectionId=missing")
+
+    old_connection = await_ranch_connection(MapSet.new())
+    connection_monitor = Process.monitor(old_connection)
     await_metric(:active_websockets, &(&1 == baseline + 1))
+    assert :ok = send_frame(socket, :binary, "retained")
+    await_metric(:backpressured_sources, &(&1 == 1))
 
-    old_budget = Process.whereis(PaseoRelay.Delivery.Budget)
-    Process.exit(old_budget, :kill)
+    old_capacity = Process.whereis(PaseoRelay.Capacity)
+    old_listener = runtime_child(PaseoRelay.Listener)
+    listener_monitor = Process.monitor(old_listener)
+    parent = self()
 
-    assert_receive {:relay_closed, ^socket,
-                    {:remote, 1013, "Relay ingress capacity unavailable"}},
-                   2_000
+    reconnect =
+      Task.async(fn ->
+        receive do
+          :reconnect ->
+            send(parent, :reconnect_started)
 
-    new_budget = await_replacement(PaseoRelay.Delivery.Budget, old_budget)
-    assert is_pid(new_budget)
-    await_metric(:active_websockets, &(&1 == baseline))
+            result =
+              reconnect_until_up(
+                port,
+                v2_path("budget-after-#{port}", "server", ""),
+                old_connection
+              )
 
-    {:ok, replacement} =
-      connect("ws://127.0.0.1:#{port}/ws?serverId=budget-after-#{port}&role=server")
+            {replacement, _old_alive?} = result
+            :ok = :gen_tcp.controlling_process(replacement, parent)
+            result
+        end
+      end)
 
-    assert_receive {:relay_open, ^replacement}
-    stop_resource({:client, replacement})
+    Process.exit(old_capacity, :kill)
+    send(reconnect.pid, :reconnect)
+
+    assert_receive :reconnect_started, 2_000
+    assert_receive {:DOWN, ^connection_monitor, :process, ^old_connection, _reason}, 2_000
+    assert_receive {:DOWN, ^listener_monitor, :process, ^old_listener, :shutdown}, 2_000
+    assert {:close, 1013, "Relay capacity unavailable"} = recv_until_close(socket)
+
+    {replacement, old_connection_alive?} = Task.await(reconnect, 5_000)
+    refute old_connection_alive?
+    track({:socket, replacement})
+
+    new_capacity = await_replacement(PaseoRelay.Capacity, old_capacity)
+    assert is_pid(new_capacity)
+    assert runtime_child(PaseoRelay.Listener) != old_listener
+    await_metric(:active_websockets, &(&1 == baseline + 1))
+    await_metric(:backpressured_sources, &(&1 == 0))
+    await_reserved(&(&1 == 0))
+
+    close_raw_websocket(replacement)
     await_metric(:active_websockets, &(&1 == baseline))
   end
 
@@ -619,7 +711,13 @@ defmodule PaseoRelay.BackpressureTest do
         | delivery_timeout_ms: Keyword.get(options, :delivery_timeout, 30_000),
           transport_send_timeout_ms: Keyword.get(options, :send_timeout, 35_000),
           control_queue_bytes: Keyword.get(options, :control_queue, 1024 * 1024),
-          data_attach_timeout_ms: Keyword.get(options, :data_attach_timeout, 15_000)
+          data_attach_timeout_ms: Keyword.get(options, :data_attach_timeout, 15_000),
+          websocket_max_heap_words:
+            Keyword.get(
+              options,
+              :websocket_heap_words,
+              PaseoRelay.Config.defaults().websocket_max_heap_words
+            )
       })
 
     relay =
@@ -640,30 +738,33 @@ defmodule PaseoRelay.BackpressureTest do
   end
 
   defp raw_connect(port, path) do
-    {:ok, socket} =
-      :gen_tcp.connect(~c"127.0.0.1", port, [
-        :binary,
-        active: false,
-        nodelay: true,
-        recbuf: 1024,
-        send_timeout: 10_000
-      ])
-
-    key = Base.encode64(:crypto.strong_rand_bytes(16))
-
-    request =
-      "GET #{path} HTTP/1.1\r\n" <>
-        "Host: relay.test\r\n" <>
-        "Upgrade: websocket\r\n" <>
-        "Connection: Upgrade\r\n" <>
-        "Sec-WebSocket-Version: 13\r\n" <>
-        "Sec-WebSocket-Key: #{key}\r\n\r\n"
-
-    :ok = :gen_tcp.send(socket, request)
-    {:ok, response} = recv_headers(socket, "")
+    {:ok, socket, response} = upgrade_once(port, path)
     assert response =~ "HTTP/1.1 101 Switching Protocols"
     track({:socket, socket})
     socket
+  end
+
+  defp upgrade_once(port, path) do
+    with {:ok, socket} <-
+           :gen_tcp.connect(~c"127.0.0.1", port, [
+             :binary,
+             active: false,
+             nodelay: true,
+             recbuf: 1024,
+             send_timeout: 10_000
+           ]),
+         key = Base.encode64(:crypto.strong_rand_bytes(16)),
+         request =
+           "GET #{path} HTTP/1.1\r\n" <>
+             "Host: relay.test\r\n" <>
+             "Upgrade: websocket\r\n" <>
+             "Connection: Upgrade\r\n" <>
+             "Sec-WebSocket-Version: 13\r\n" <>
+             "Sec-WebSocket-Key: #{key}\r\n\r\n",
+         :ok <- :gen_tcp.send(socket, request),
+         {:ok, response} <- recv_headers(socket, "") do
+      {:ok, socket, response}
+    end
   end
 
   defp connect(url, owner \\ nil) do
@@ -683,6 +784,10 @@ defmodule PaseoRelay.BackpressureTest do
 
   defp v2_url(port, server_id, role, connection_id) do
     "ws://127.0.0.1:#{port}/ws?serverId=#{server_id}&role=#{role}&v=2&connectionId=#{connection_id}"
+  end
+
+  defp v2_path(server_id, role, connection_id) do
+    "/ws?serverId=#{server_id}&role=#{role}&v=2&connectionId=#{connection_id}"
   end
 
   defp recv_headers(socket, acc) do
@@ -779,6 +884,14 @@ defmodule PaseoRelay.BackpressureTest do
     end
   end
 
+  defp await_transport_close(socket) do
+    case :gen_tcp.recv(socket, 0, 2_000) do
+      {:error, :closed} -> :ok
+      {:ok, _bytes} -> await_transport_close(socket)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   defp writer_processes do
     Process.list()
     |> Enum.filter(fn process ->
@@ -836,6 +949,69 @@ defmodule PaseoRelay.BackpressureTest do
     end
   end
 
+  defp runtime_child(id) do
+    PaseoRelay.RuntimeSupervisor
+    |> Supervisor.which_children()
+    |> Enum.find_value(fn
+      {^id, process, _type, _modules} -> process
+      _other -> nil
+    end)
+  end
+
+  defp await_ranch_connection(existing) do
+    deadline = System.monotonic_time(:millisecond) + 2_000
+    await_ranch_connection(existing, deadline)
+  end
+
+  defp await_ranch_connection(existing, deadline) do
+    connections =
+      PaseoRelay.Listener
+      |> :ranch.procs(:connections)
+      |> MapSet.new()
+      |> MapSet.difference(existing)
+      |> MapSet.to_list()
+
+    cond do
+      match?([_connection], connections) ->
+        hd(connections)
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("expected one Ranch connection, got #{inspect(connections)}")
+
+      true ->
+        Process.sleep(10)
+        await_ranch_connection(existing, deadline)
+    end
+  end
+
+  defp reconnect_until_up(port, path, old_connection) do
+    deadline = System.monotonic_time(:millisecond) + 5_000
+    reconnect_until_up(port, path, old_connection, deadline)
+  end
+
+  defp reconnect_until_up(port, path, old_connection, deadline) do
+    case upgrade_once(port, path) do
+      {:ok, socket, "HTTP/1.1 101" <> _response} ->
+        {socket, Process.alive?(old_connection)}
+
+      {:ok, socket, _response} ->
+        :gen_tcp.close(socket)
+        retry_reconnect(port, path, old_connection, deadline)
+
+      {:error, _reason} ->
+        retry_reconnect(port, path, old_connection, deadline)
+    end
+  end
+
+  defp retry_reconnect(port, path, old_connection, deadline) do
+    if System.monotonic_time(:millisecond) >= deadline do
+      flunk("production listener did not reopen")
+    end
+
+    Process.sleep(10)
+    reconnect_until_up(port, path, old_connection, deadline)
+  end
+
   defp close_raw(socket) do
     :gen_tcp.close(socket)
     :ok
@@ -889,11 +1065,7 @@ defmodule PaseoRelay.BackpressureTest do
   end
 
   defp reconfigure_pressure(watermark) do
-    child = PaseoRelay.Delivery.Pressure
-    :ok = Supervisor.terminate_child(PaseoRelay.Supervisor, child)
-    :ok = Supervisor.delete_child(PaseoRelay.Supervisor, child)
-    {:ok, _process} = Supervisor.start_child(PaseoRelay.Supervisor, {child, watermark})
-    :ok
+    PaseoRelay.Capacity.set_watermark(watermark)
   end
 
   defp transient_gauges do

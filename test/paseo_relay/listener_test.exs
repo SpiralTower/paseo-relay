@@ -74,22 +74,10 @@ defmodule PaseoRelay.ListenerTest do
     assert_eventually(fn -> PaseoRelay.ConnectionBudget.active(reference) == 0 end)
   end
 
-  test "active WebSockets fail closed when the connection budget restarts" do
-    reference = {:listener_budget_restart, System.unique_integer([:positive])}
-    active_websockets = PaseoRelay.Metrics.value(:active_websockets)
-
-    start_supervised!(
-      {PaseoRelay.Listener,
-       ref: reference,
-       config: PaseoRelay.Config.defaults(),
-       ip: {127, 0, 0, 1},
-       port: 0,
-       acceptors: 1,
-       max_connections: 100,
-       max_websockets: 2}
-    )
-
+  test "capacity loss stops the production listener before admission reopens" do
+    reference = PaseoRelay.Listener
     port = PaseoRelay.Listener.port(reference)
+    active_websockets = PaseoRelay.Metrics.value(:active_websockets)
     socket = open_websocket(port, "budget-restart-existing")
     assert PaseoRelay.ConnectionBudget.active(reference) == 1
 
@@ -97,22 +85,36 @@ defmodule PaseoRelay.ListenerTest do
       PaseoRelay.Metrics.value(:active_websockets) == active_websockets + 1
     end)
 
-    budget = Process.whereis(PaseoRelay.ConnectionBudget)
-    monitor = Process.monitor(budget)
-    Process.exit(budget, :kill)
-    assert_receive {:DOWN, ^monitor, :process, ^budget, :killed}, 2_000
-
+    capacity = Process.whereis(PaseoRelay.Capacity)
+    listener = runtime_child(PaseoRelay.Listener)
+    capacity_monitor = Process.monitor(capacity)
+    listener_monitor = Process.monitor(listener)
+    Process.exit(capacity, :kill)
+    assert_receive {:DOWN, ^capacity_monitor, :process, ^capacity, :killed}, 2_000
+    assert_receive {:DOWN, ^listener_monitor, :process, ^listener, :shutdown}, 2_000
     assert {:close, 1013, "Relay capacity unavailable"} = recv_until_close(socket)
 
     assert_eventually(fn ->
-      replacement = Process.whereis(PaseoRelay.ConnectionBudget)
-      is_pid(replacement) and replacement != budget
+      replacement_capacity = Process.whereis(PaseoRelay.Capacity)
+      replacement_listener = runtime_child(PaseoRelay.Listener)
+
+      is_pid(replacement_capacity) and replacement_capacity != capacity and
+        is_pid(replacement_listener) and replacement_listener != listener
     end)
 
     replacement = open_websocket(port, "budget-restart-new")
     assert PaseoRelay.ConnectionBudget.active(reference) == 1
     :ok = :gen_tcp.close(replacement)
     assert_eventually(fn -> PaseoRelay.ConnectionBudget.active(reference) == 0 end)
+  end
+
+  defp runtime_child(id) do
+    PaseoRelay.RuntimeSupervisor
+    |> Supervisor.which_children()
+    |> Enum.find_value(fn
+      {^id, process, _type, _modules} -> process
+      _other -> nil
+    end)
   end
 
   test "the active WebSocket gauge reconciles when the heap fuse kills a socket" do
@@ -138,6 +140,54 @@ defmodule PaseoRelay.ListenerTest do
 
     assert_eventually(fn -> PaseoRelay.ConnectionBudget.active(reference) == 0 end)
     assert PaseoRelay.Metrics.value(:active_websockets) == 0
+  end
+
+  test "a queued reservation expiry cannot release an attached connection" do
+    namespace = {:stale_expiry, System.unique_integer([:positive])}
+    assert {:ok, token} = PaseoRelay.ConnectionBudget.admit(namespace, 1)
+    assert {:ok, _capacity} = PaseoRelay.ConnectionBudget.attach(token)
+
+    send(PaseoRelay.Capacity, {:expire, token})
+
+    assert PaseoRelay.ConnectionBudget.active(namespace) == 1
+    assert :ok = PaseoRelay.ConnectionBudget.release(token)
+    assert PaseoRelay.ConnectionBudget.active(namespace) == 0
+  end
+
+  test "pressure shedding makes message admission terminal for the selected socket" do
+    namespace = {:shedding_terminal, System.unique_integer([:positive])}
+    watermark = PaseoRelay.Config.defaults().memory_watermark_bytes
+    on_exit(fn -> PaseoRelay.Capacity.set_watermark(watermark) end)
+
+    assert {:ok, connection} = PaseoRelay.ConnectionBudget.admit(namespace, 1)
+    assert {:ok, _capacity} = PaseoRelay.ConnectionBudget.attach(connection)
+    assert {:ok, message} = PaseoRelay.Capacity.admit_message(1)
+
+    assert :ok = PaseoRelay.Capacity.set_watermark(1)
+    assert :ok = PaseoRelay.Capacity.check_now()
+
+    assert {:error, :closed} = PaseoRelay.Capacity.admit_message(1)
+    assert {:error, :closed} = PaseoRelay.Capacity.start_delivery(message)
+    assert :ok = PaseoRelay.ConnectionBudget.release(connection)
+  end
+
+  test "one pressure check sheds enough real sockets for the current memory overshoot" do
+    port = PaseoRelay.Listener.port(PaseoRelay.Listener)
+    first = open_websocket(port, "pressure-batch-first")
+    second = open_websocket(port, "pressure-batch-second")
+    padding = :binary.copy(<<0x4D>>, 40 * 1024 * 1024)
+    maximum_message = PaseoRelay.Protocol.maximum_message_payload_bytes()
+    watermark = :erlang.memory(:total) - maximum_message - 1
+    assert watermark > 0
+
+    on_exit(fn -> PaseoRelay.Capacity.set_watermark(0) end)
+    assert :ok = PaseoRelay.Capacity.set_watermark(watermark)
+    assert :ok = PaseoRelay.Capacity.check_now()
+    assert byte_size(padding) == 40 * 1024 * 1024
+    assert :ok = PaseoRelay.Capacity.set_watermark(0)
+
+    assert {:close, 1013, "Relay memory pressure"} = recv_until_close(first)
+    assert {:close, 1013, "Relay memory pressure"} = recv_until_close(second)
   end
 
   defp open_websocket(port, server_id) do

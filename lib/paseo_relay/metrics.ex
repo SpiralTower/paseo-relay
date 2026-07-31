@@ -52,7 +52,7 @@ defmodule PaseoRelay.Metrics do
     {@maximum_message_payload_bytes, :frame_size_le_32m,
      Integer.to_string(@maximum_message_payload_bytes)}
   ]
-  @computed_names ~w(active_websockets active_sessions max_frame_bytes beam_total_memory beam_process_memory beam_binary_memory beam_ets_memory)a
+  @computed_names ~w(active_websockets active_sessions ingress_reserved_bytes inflight_delivery_bytes backpressured_sources max_frame_bytes beam_total_memory beam_process_memory beam_binary_memory beam_ets_memory)a
   @counter_names (@metrics |> Enum.map(&elem(&1, 0)) |> Kernel.--(@computed_names)) ++
                    [
                      :delivery_wait_microseconds,
@@ -67,7 +67,16 @@ defmodule PaseoRelay.Metrics do
 
   def inc(name, amount \\ 1), do: :counters.add(counters(), index(name), amount)
   def dec(name, amount \\ 1), do: inc(name, -amount)
-  def value(:active_websockets), do: PaseoRelay.ConnectionBudget.active_websockets()
+
+  def value(name)
+      when name in [
+             :active_websockets,
+             :ingress_reserved_bytes,
+             :inflight_delivery_bytes,
+             :backpressured_sources
+           ],
+      do: PaseoRelay.Capacity.value(name)
+
   def value(:active_sessions), do: :syn.local_registry_count(:paseo_relay_owners)
   def value(:beam_total_memory), do: :erlang.memory(:total)
   def value(:beam_process_memory), do: :erlang.memory(:processes)

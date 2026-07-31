@@ -4,7 +4,6 @@ defmodule PaseoRelay.Socket do
   @behaviour :cowboy_websocket
 
   alias PaseoRelay.Delivery
-  alias PaseoRelay.Delivery.Budget
   alias PaseoRelay.Delivery.Writer
   alias PaseoRelay.Ownership.Owner
 
@@ -29,7 +28,7 @@ defmodule PaseoRelay.Socket do
         pending: :queue.new()
       }
 
-      {:cowboy_websocket, request, state, websocket_options()}
+      {:cowboy_websocket, request, state, websocket_options(connection)}
     else
       {:reroute, _target} = decision ->
         PaseoRelay.Metrics.inc(:reroute_responses)
@@ -66,9 +65,7 @@ defmodule PaseoRelay.Socket do
       kill: true
     })
 
-    with {:ok, connection_budget} <- PaseoRelay.ConnectionBudget.attach(state.admission),
-         {:ok, ingress_budget} <- Budget.attach(),
-         {:ok, pressure} <- PaseoRelay.Delivery.Pressure.attach(),
+    with {:ok, capacity} <- PaseoRelay.ConnectionBudget.attach(state.admission),
          {:ok, writer} <-
            Writer.start(
              self(),
@@ -78,10 +75,8 @@ defmodule PaseoRelay.Socket do
       state =
         Map.put(state, :admission, %{
           token: state.admission,
-          monitor: Process.monitor(connection_budget)
+          monitor: Process.monitor(capacity)
         })
-        |> Map.put(:ingress_budget_ref, Process.monitor(ingress_budget))
-        |> Map.put(:pressure_ref, Process.monitor(pressure))
 
       attach_writer(writer, state)
     else
@@ -100,8 +95,8 @@ defmodule PaseoRelay.Socket do
   def websocket_handle({opcode, payload}, state) when opcode in [:text, :binary] do
     PaseoRelay.Metrics.observe_frame(byte_size(payload))
 
-    case PaseoRelay.Delivery.Budget.admit(byte_size(payload)) do
-      :ok -> admit_input(opcode, payload, state)
+    case PaseoRelay.Capacity.admit_message(byte_size(payload)) do
+      {:ok, token} -> admit_input(opcode, payload, token, state)
       {:error, _reason} -> {[{:close, 1013, "Relay ingress capacity"}], state}
     end
   end
@@ -154,20 +149,6 @@ defmodule PaseoRelay.Socket do
     {[{:close, 1013, "Relay capacity unavailable"}], cancel_delivery(state)}
   end
 
-  def websocket_info(
-        {:DOWN, ref, :process, _budget, _reason},
-        %{ingress_budget_ref: ref} = state
-      ) do
-    {[{:close, 1013, "Relay ingress capacity unavailable"}], cancel_delivery(state)}
-  end
-
-  def websocket_info(
-        {:DOWN, ref, :process, _pressure, _reason},
-        %{pressure_ref: ref} = state
-      ) do
-    {[{:close, 1013, "Relay memory pressure unavailable"}], cancel_delivery(state)}
-  end
-
   def websocket_info({:relay_close, code, reason}, state) do
     {[{:close, code, reason}], cancel_delivery(state)}
   end
@@ -178,48 +159,56 @@ defmodule PaseoRelay.Socket do
   def terminate(_reason, _request, %{owner: owner} = state) do
     if delivery = state[:delivery] do
       stop_delivery_task(delivery)
-      complete_delivery_metrics(delivery)
+      PaseoRelay.Capacity.cancel_message(delivery.token)
     end
 
-    PaseoRelay.Delivery.Budget.release_all()
     PaseoRelay.ConnectionBudget.release(admission_token(state.admission))
-    PaseoRelay.Delivery.Pressure.leave(self())
     Owner.detach(owner, self())
   end
 
   def terminate(_reason, _request, _state), do: :ok
 
-  defp admit_input(opcode, payload, %{delivery: _delivery} = state) do
-    pending = :queue.in({opcode, payload}, state.pending)
+  defp admit_input(opcode, payload, token, %{delivery: _delivery} = state) do
+    pending = :queue.in({opcode, payload, token}, state.pending)
     {[{:active, false}], %{state | pending: pending}}
   end
 
-  defp admit_input(opcode, payload, state) do
-    {[{:active, false}], start_delivery(opcode, payload, state)}
+  defp admit_input(opcode, payload, token, state) do
+    case start_delivery(opcode, payload, token, state) do
+      {:ok, state} -> {[{:active, false}], state}
+      {:error, state} -> {[{:close, 1013, "Relay memory pressure"}], state}
+    end
   end
 
-  defp start_delivery(opcode, payload, state) do
-    PaseoRelay.Metrics.inc(:backpressured_sources)
-    PaseoRelay.Metrics.inc(:inflight_delivery_bytes, byte_size(payload))
-    PaseoRelay.Delivery.Pressure.block(self())
-    source = self()
-    task = Task.async(fn -> deliver_input(payload, opcode, state, source) end)
+  defp start_delivery(opcode, payload, token, state) do
+    case PaseoRelay.Capacity.start_delivery(token) do
+      :ok ->
+        source = self()
+        task = Task.async(fn -> deliver_input(payload, opcode, state, source) end)
 
-    delivery = %{
-      ref: task.ref,
-      pid: task.pid,
-      bytes: byte_size(payload),
-      started: System.monotonic_time()
-    }
+        delivery = %{
+          ref: task.ref,
+          pid: task.pid,
+          token: token
+        }
 
-    Map.put(state, :delivery, delivery)
+        {:ok, Map.put(state, :delivery, delivery)}
+
+      {:error, _reason} ->
+        PaseoRelay.Capacity.cancel_message(token)
+        {:error, state}
+    end
   end
 
   defp continue_or_resume(state) do
     case :queue.out(state.pending) do
-      {{:value, {opcode, payload}}, pending} ->
+      {{:value, {opcode, payload, token}}, pending} ->
         state = %{state | pending: pending}
-        {[], start_delivery(opcode, payload, state)}
+
+        case start_delivery(opcode, payload, token, state) do
+          {:ok, state} -> {[], state}
+          {:error, state} -> {[{:close, 1013, "Relay memory pressure"}], state}
+        end
 
       {:empty, _pending} ->
         {[{:active, true}], state}
@@ -240,15 +229,14 @@ defmodule PaseoRelay.Socket do
   defp handle_control_input({:text, payload}, state) do
     PaseoRelay.Metrics.observe_frame(byte_size(payload))
 
-    with {:ok, %{"type" => "ping"}} <- Jason.decode(payload) do
-      pong = Jason.encode!(%{type: "pong", ts: System.system_time(:millisecond)})
+    case PaseoRelay.Capacity.admit_message(byte_size(payload)) do
+      {:ok, token} ->
+        result = handle_admitted_control(payload, state)
+        :ok = PaseoRelay.Capacity.finish_message(token)
+        result
 
-      case Owner.control(state.owner, self(), pong) do
-        :ok -> {[], state}
-        {:error, _reason} -> {[{:close, 1013, "Delivery unavailable"}], state}
-      end
-    else
-      _ -> {[], state}
+      {:error, _reason} ->
+        {[{:close, 1013, "Relay ingress capacity"}], state}
     end
   end
 
@@ -256,16 +244,8 @@ defmodule PaseoRelay.Socket do
 
   defp finish_delivery(state) do
     delivery = state.delivery
-    PaseoRelay.Delivery.Pressure.unblock(self())
-    PaseoRelay.Delivery.Budget.release(delivery.bytes)
-    complete_delivery_metrics(delivery)
+    PaseoRelay.Capacity.finish_message(delivery.token)
     Map.delete(state, :delivery)
-  end
-
-  defp complete_delivery_metrics(delivery) do
-    PaseoRelay.Metrics.dec(:backpressured_sources)
-    PaseoRelay.Metrics.dec(:inflight_delivery_bytes, delivery.bytes)
-    PaseoRelay.Metrics.observe_delivery_wait(System.monotonic_time() - delivery.started)
   end
 
   defp cancel_delivery(%{delivery: delivery} = state) do
@@ -307,13 +287,34 @@ defmodule PaseoRelay.Socket do
   defp admission_token(%{token: token}), do: token
   defp admission_token(token), do: token
 
-  defp websocket_options do
+  defp websocket_options(%{version: 2, role: :server, connection_id: ""}) do
+    websocket_options_with_limit(PaseoRelay.Protocol.maximum_control_payload_bytes())
+  end
+
+  defp websocket_options(_connection) do
+    websocket_options_with_limit(PaseoRelay.Protocol.maximum_message_payload_bytes())
+  end
+
+  defp websocket_options_with_limit(max_frame_size) do
     %{
       active_n: 1,
       compress: false,
       idle_timeout: :infinity,
-      max_frame_size: PaseoRelay.Protocol.maximum_message_payload_bytes()
+      max_frame_size: max_frame_size
     }
+  end
+
+  defp handle_admitted_control(payload, state) do
+    with {:ok, %{"type" => "ping"}} <- Jason.decode(payload) do
+      pong = Jason.encode!(%{type: "pong", ts: System.system_time(:millisecond)})
+
+      case Owner.control(state.owner, self(), pong) do
+        :ok -> {[], state}
+        {:error, _reason} -> {[{:close, 1013, "Delivery unavailable"}], state}
+      end
+    else
+      _ -> {[], state}
+    end
   end
 
   defp reply(request, status, headers, body) do
