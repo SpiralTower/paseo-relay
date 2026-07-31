@@ -516,6 +516,11 @@ defmodule PaseoRelay.Ownership.Owner do
   defp call(owner, message) do
     GenServer.call(owner, message, @call_timeout_ms)
   catch
-    :exit, _reason -> :closed
+    :exit, {:timeout, _call} ->
+      Process.exit(owner, :kill)
+      :closed
+
+    :exit, _reason ->
+      :closed
   end
 end

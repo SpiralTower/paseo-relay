@@ -90,6 +90,27 @@ defmodule PaseoRelay.RelayProtocolTest do
     close_clients([control])
   end
 
+  @tag timeout: 8_000
+  test "v2 control fails closed when its Owner stalls during a ping" do
+    port = start_relay()
+
+    {:ok, control} = connect(v2_url(port, "server"))
+    assert_receive {:relay_open, ^control}
+    assert_control(control, %{"type" => "sync", "connectionIds" => []})
+    owner = PaseoRelay.Ownership.owner_pid(v2_server_id(port))
+    owner_ref = Process.monitor(owner)
+    :ok = :sys.suspend(owner)
+
+    on_exit(fn ->
+      if Process.alive?(owner), do: :sys.resume(owner)
+    end)
+
+    :ok = WebSockex.send_frame(control, {:text, ~s({"type":"ping"})})
+    assert_receive {:relay_closed, ^control, {:remote, 1013, "Delivery unavailable"}}, 7_000
+    assert_receive {:DOWN, ^owner_ref, :process, ^owner, :killed}, 1_000
+    close_clients([control])
+  end
+
   test "v2 resets an unresponsive control after nudging it to attach client data" do
     port = start_relay()
 

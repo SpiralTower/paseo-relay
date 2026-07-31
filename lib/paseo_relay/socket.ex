@@ -329,6 +329,7 @@ defmodule PaseoRelay.Socket do
 
       case Owner.control(state.owner, self(), pong) do
         :ok -> {[], state}
+        :closed -> {[{:close, 1013, "Delivery unavailable"}], state}
         {:error, _reason} -> {[{:close, 1013, "Delivery unavailable"}], state}
       end
     else

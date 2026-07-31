@@ -605,3 +605,10 @@
   `/metrics` perform four sequential five-second calls; one snapshot call now
   returns all four transient gauges or one bounded fallback. Both public fault
   tests passed four consecutive focused runs.
+- Control-ping authority red/green: a real v2 control ping against a suspended
+  Owner made the bounded call return bare `:closed`; the unmatched result raised
+  `CaseClauseError` and the peer observed abnormal `1011`. Timed-out Owner calls
+  now retire the stalled authority, and the control socket converts `:closed`
+  into explicit retryable `1013 Delivery unavailable`. The exact public
+  regression passed four consecutive runs, followed by the complete 82/82 suite
+  at seed `804904`.
