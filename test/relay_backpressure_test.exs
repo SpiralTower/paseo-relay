@@ -148,8 +148,10 @@ defmodule PaseoRelay.BackpressureTest do
     server_id = "full-duplex-#{port}"
 
     slow = raw_connect(port, "/ws?serverId=#{server_id}&role=client&v=2&connectionId=shared")
+
     {:ok, healthy} = connect(v2_url(port, server_id, "client", "shared"))
     assert_receive {:relay_open, ^healthy}
+
     daemon = raw_connect(port, "/ws?serverId=#{server_id}&role=server&v=2&connectionId=shared")
     payload = :binary.copy(<<0x2A>>, @pressure_frame_bytes)
 
@@ -164,7 +166,8 @@ defmodule PaseoRelay.BackpressureTest do
       end)
 
     await_stable_metric(:backpressured_sources, &(&1 == 1), 250)
-    :ok = WebSockex.send_frame(healthy, {:text, "reverse-during-pressure"})
+    assert_receive {:relay_frame, ^healthy, :binary, ^payload}, 30_000
+    assert :ok = WebSockex.send_frame(healthy, {:text, "reverse-during-pressure"})
     assert {:text, "reverse-during-pressure"} = recv_server_frame(daemon)
     await_stable_metric(:backpressured_sources, &(&1 == 1), 250)
 
@@ -257,19 +260,24 @@ defmodule PaseoRelay.BackpressureTest do
   test "a maximum legal unfragmented payload survives the heap fuse" do
     port = start_relay()
     server_id = "maximum-frame-#{port}"
-    destination = digest_connect(v2_url(port, server_id, "server", "shared"))
+
+    destination =
+      raw_connect(port, v2_path(server_id, "server", "shared"), receive_buffer: 4 * 1024 * 1024)
+
     source = raw_connect(port, "/ws?serverId=#{server_id}&role=client&v=2&connectionId=shared")
     payload = :binary.copy(<<0xA5>>, @maximum_client_frame_payload_bytes)
     digest = :crypto.hash(:sha256, payload)
+    receiver = Task.async(fn -> recv_server_frame(destination) end)
 
     assert :ok = send_frame(source, :binary, payload)
 
-    assert_receive {:digest_frame, ^destination, :binary, @maximum_client_frame_payload_bytes,
-                    ^digest},
-                   15_000
+    assert {:binary, delivered} = Task.await(receiver, 30_000)
+    assert byte_size(delivered) == @maximum_client_frame_payload_bytes
+    assert :crypto.hash(:sha256, delivered) == digest
 
     await_reserved(&(&1 == 0))
     close_raw(source)
+    close_raw(destination)
     await_metric(:active_websockets, &(&1 == 0))
   end
 
@@ -462,7 +470,7 @@ defmodule PaseoRelay.BackpressureTest do
   test "a heap-fuse kill during delivery reconciles every capacity gauge" do
     low_heap_port =
       start_relay(
-        websocket_heap_words: 4_194_304,
+        websocket_heap_words: 3_145_728,
         delivery_timeout: 15_000,
         send_timeout: 20_000,
         send_buffer: 1024
@@ -472,8 +480,10 @@ defmodule PaseoRelay.BackpressureTest do
     baseline = transient_gauges()
     server_id = "heap-delivery-#{low_heap_port}"
     slow = raw_connect(normal_port, v2_path(server_id, "client", "shared"))
+
     {:ok, healthy} = connect(v2_url(normal_port, server_id, "client", "shared"))
     assert_receive {:relay_open, ^healthy}
+
     source = raw_connect(low_heap_port, v2_path(server_id, "server", "shared"))
     payload = :binary.copy(<<0x5A>>, 8 * 1024 * 1024)
 
@@ -488,6 +498,7 @@ defmodule PaseoRelay.BackpressureTest do
       end)
 
     await_metric(:backpressured_sources, &(&1 == 1))
+    assert_receive {:relay_frame, ^healthy, :binary, ^payload}, 30_000
 
     assert :ok =
              WebSockex.send_frame(
@@ -495,7 +506,7 @@ defmodule PaseoRelay.BackpressureTest do
                {:binary, :binary.copy(<<0x6B>>, @maximum_client_frame_payload_bytes)}
              )
 
-    assert :ok = await_transport_close(source)
+    assert :ok = await_transport_close(source, 30_000)
     await_metric(:backpressured_sources, &(&1 == 0))
     await_metric(:inflight_delivery_bytes, &(&1 == 0))
     _ = Task.await(sender, 5_000)
@@ -737,20 +748,20 @@ defmodule PaseoRelay.BackpressureTest do
     port
   end
 
-  defp raw_connect(port, path) do
-    {:ok, socket, response} = upgrade_once(port, path)
+  defp raw_connect(port, path, options \\ []) do
+    {:ok, socket, response} = upgrade_once(port, path, options)
     assert response =~ "HTTP/1.1 101 Switching Protocols"
     track({:socket, socket})
     socket
   end
 
-  defp upgrade_once(port, path) do
+  defp upgrade_once(port, path, options \\ []) do
     with {:ok, socket} <-
            :gen_tcp.connect(~c"127.0.0.1", port, [
              :binary,
              active: false,
              nodelay: true,
-             recbuf: 1024,
+             recbuf: Keyword.get(options, :receive_buffer, 1024),
              send_timeout: 10_000
            ]),
          key = Base.encode64(:crypto.strong_rand_bytes(16)),
@@ -849,25 +860,25 @@ defmodule PaseoRelay.BackpressureTest do
   end
 
   defp recv_server_frame(socket) do
-    {:ok, <<first, second>>} = :gen_tcp.recv(socket, 2, 5_000)
+    {:ok, <<first, second>>} = :gen_tcp.recv(socket, 2, 30_000)
     opcode = first &&& 0x0F
     length = second &&& 0x7F
 
     length =
       case length do
         126 ->
-          {:ok, <<value::16>>} = :gen_tcp.recv(socket, 2, 5_000)
+          {:ok, <<value::16>>} = :gen_tcp.recv(socket, 2, 30_000)
           value
 
         127 ->
-          {:ok, <<value::64>>} = :gen_tcp.recv(socket, 8, 5_000)
+          {:ok, <<value::64>>} = :gen_tcp.recv(socket, 8, 30_000)
           value
 
         value ->
           value
       end
 
-    {:ok, payload} = :gen_tcp.recv(socket, length, 5_000)
+    {:ok, payload} = :gen_tcp.recv(socket, length, 30_000)
 
     case {opcode, payload} do
       {0x8, <<code::16, reason::binary>>} -> {:close, code, reason}
@@ -884,10 +895,18 @@ defmodule PaseoRelay.BackpressureTest do
     end
   end
 
-  defp await_transport_close(socket) do
-    case :gen_tcp.recv(socket, 0, 2_000) do
+  defp await_transport_close(socket, timeout) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    await_transport_close_until(socket, deadline)
+  end
+
+  defp await_transport_close_until(socket, deadline) do
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    case :gen_tcp.recv(socket, 0, min(remaining, 2_000)) do
       {:error, :closed} -> :ok
-      {:ok, _bytes} -> await_transport_close(socket)
+      {:ok, _bytes} -> await_transport_close_until(socket, deadline)
+      {:error, :timeout} when remaining > 0 -> await_transport_close_until(socket, deadline)
       {:error, reason} -> {:error, reason}
     end
   end

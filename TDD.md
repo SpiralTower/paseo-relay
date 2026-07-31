@@ -198,6 +198,17 @@
   reconciled active sockets, retained bytes, in-flight bytes, and blocked sources
   each time. The final local gate passed formatting, warnings-as-errors test
   compilation, unused-lock validation, and all 73 tests in 101.2 seconds.
+- Clean Linux CI red completed 70/73: the large-frame full-duplex and heap tests
+  queued reverse sends behind an 8 MiB WebSockex receive, while the maximum-frame
+  digest callback missed its 15-second runner deadline. The runtime boundary was
+  healthy; the secondary client scheduling made the evidence platform-dependent.
+  The tests now wait for the healthy WebSockex peer to finish the forward frame
+  before sending reverse traffic, receive the maximum frame through the existing
+  raw WebSocket boundary, and use a bounded deadline while awaiting the real
+  max-heap transport close. All three focused tests passed four consecutive local
+  runs after the correction; the post-correction complete suite passed 73/73 in
+  97.5 seconds with formatting, warnings-as-errors compilation, and lock
+  validation green.
 
 ### Final standards architectural audit
 
