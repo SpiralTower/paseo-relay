@@ -212,6 +212,7 @@ defmodule PaseoRelay.DistributedOwnershipTest do
     Process.exit(local_session, :kill)
     assert_receive {:DOWN, ^owner_down, :process, ^owner_record, _reason}, 5_500
     assert :unowned = await_resolve(node(), "server-e", :unowned)
+    assert :unowned = await_resolve(peer, "server-e", :unowned)
 
     remote_session = :rpc.call(peer, :erlang, :spawn, [:timer, :sleep, [:infinity]])
 
@@ -220,6 +221,42 @@ defmodule PaseoRelay.DistributedOwnershipTest do
 
     assert {:reroute, "opaque-owner-b"} =
              await_resolve(node(), "server-e", {:reroute, "opaque-owner-b"})
+
+    :rpc.call(peer, Process, :exit, [remote_session, :kill])
+  end
+
+  test "a client landing on a disjoint node reroutes to the real websocket owner", %{
+    peers: [peer_a, peer_b],
+    peer_ports: ports
+  } do
+    server_id = "disjoint-route-#{System.unique_integer([:positive])}"
+    port_a = Map.fetch!(ports, peer_a)
+    port_b = Map.fetch!(ports, peer_b)
+
+    {:ok, server} = connect_role_on(peer_a, port_a, server_id, "server", "shared")
+    assert_receive {:partition_open, ^server}
+
+    response = websocket_upgrade(port_b, server_id, "client", "shared")
+    assert "HTTP/1.1 409" <> _ = response
+    assert response =~ "x-reroute-target: #{peer_a}"
+    assert {:reroute, target} = :rpc.call(peer_b, Ownership, :resolve, [server_id])
+    assert target == Atom.to_string(peer_a)
+
+    {:ok, client} = connect_role_on(peer_a, port_a, server_id, "client", "shared")
+    assert_receive {:partition_open, ^client}
+
+    assert :ok = :rpc.call(peer_a, WebSockex, :send_frame, [client, {:text, "to-server"}])
+    assert_receive {:partition_frame, ^server, :text, "to-server"}
+
+    assert :ok = :rpc.call(peer_a, WebSockex, :send_frame, [server, {:binary, <<1, 2, 3>>}])
+    assert_receive {:partition_frame, ^client, :binary, <<1, 2, 3>>}
+
+    :rpc.call(peer_a, Process, :exit, [client, :kill])
+    :rpc.call(peer_a, Process, :exit, [server, :kill])
+    owner = :rpc.call(peer_a, Ownership, :owner_pid, [server_id])
+    :rpc.call(peer_a, Process, :exit, [owner, :kill])
+    assert :unowned = await_resolve(peer_a, server_id, :unowned)
+    assert :unowned = await_resolve(peer_b, server_id, :unowned)
   end
 
   @tag timeout: 30_000
@@ -315,39 +352,19 @@ defmodule PaseoRelay.DistributedOwnershipTest do
   defp start_relay(peer) do
     load_module(peer, PartitionClient)
 
-    :ok =
-      :rpc.call(peer, :application, :set_env, [
-        :paseo_relay,
-        :operations,
-        [host: "127.0.0.1", ip: {127, 0, 0, 1}, port: 0, drain: false]
-      ])
+    config = %{
+      PaseoRelay.Config.defaults()
+      | port: 0,
+        ownership_target: Atom.to_string(peer),
+        reroute_header: "x-reroute-target"
+    }
 
-    :ok =
-      :rpc.call(peer, :application, :set_env, [
-        :paseo_relay,
-        :ownership_target,
-        Atom.to_string(peer)
-      ])
-
-    :ok =
-      :rpc.call(peer, :application, :set_env, [
-        :paseo_relay,
-        :reroute_header,
-        "x-reroute-target"
-      ])
+    :ok = :rpc.call(peer, :application, :set_env, [:paseo_relay, :runtime, config])
 
     {:ok, _applications} =
       :rpc.call(peer, :application, :ensure_all_started, [:paseo_relay])
 
-    children = :rpc.call(peer, Supervisor, :which_children, [PaseoRelay.Supervisor])
-
-    {_id, listener, :supervisor, _modules} =
-      Enum.find(children, fn {_id, _pid, _type, modules} -> Bandit in modules end)
-
-    {:ok, {_address, port}} =
-      :rpc.call(peer, ThousandIsland, :listener_info, [listener])
-
-    port
+    :rpc.call(peer, :ranch, :get_port, [PaseoRelay.Listener])
   end
 
   defp load_module(peer, module) do
@@ -356,7 +373,13 @@ defmodule PaseoRelay.DistributedOwnershipTest do
   end
 
   defp connect_on(peer, port, server_id) do
-    url = "ws://127.0.0.1:#{port}/ws?serverId=#{server_id}&role=server&v=2"
+    connect_role_on(peer, port, server_id, "server", "")
+  end
+
+  defp connect_role_on(peer, port, server_id, role, connection_id) do
+    url =
+      "ws://127.0.0.1:#{port}/ws?serverId=#{server_id}&role=#{role}&v=2&connectionId=#{connection_id}"
+
     :rpc.call(peer, PartitionClient, :start, [url, self()])
   end
 
@@ -391,10 +414,14 @@ defmodule PaseoRelay.DistributedOwnershipTest do
   end
 
   defp websocket_upgrade(port, server_id) do
+    websocket_upgrade(port, server_id, "client", "")
+  end
+
+  defp websocket_upgrade(port, server_id, role, connection_id) do
     {:ok, socket} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false])
 
     request =
-      "GET /ws?serverId=#{server_id}&role=client&v=2 HTTP/1.1\r\n" <>
+      "GET /ws?serverId=#{server_id}&role=#{role}&v=2&connectionId=#{connection_id} HTTP/1.1\r\n" <>
         "Host: relay.test\r\n" <>
         "Upgrade: websocket\r\n" <>
         "Connection: Upgrade\r\n" <>

@@ -54,6 +54,17 @@ When a WebSocket request reaches a non-owner, the generic reroute adapter emits
 `fly-replay: instance=<machine-id>` before WebSocket negotiation. Fly Proxy then
 replays the unchanged upgrade request to the owner.
 
+After a deliberate deployment, the provider-specific black-box check can force
+the owner and initial landing to different Machines while exercising the public
+WebSocket protocol:
+
+```sh
+MIX_ENV=test mix run deployment/fly/replay-e2e.exs -- \
+  --endpoint "$RELAY_URL" \
+  --owner OWNER_MACHINE_ID \
+  --landing LANDING_MACHINE_ID
+```
+
 The entrypoint raises the per-process file descriptor limit to 100,000 by
 default. Override `PASEO_RELAY_NOFILE` when a deployment needs a different
 ceiling. The sample VM size and connection limits in `fly.toml` are starting
@@ -118,7 +129,7 @@ Interpret the important series as follows:
 | `active_websockets` / `active_sessions` | Current application load, not failure by itself |
 | configured Fly soft limit crossed | Placement/capacity signal only |
 | configured Fly hard limit reached | Fly will not assign new connections to that Machine |
-| `connection_rejections_total` increases | The relay rejected connections; users are affected |
+| `connection_rejections_total` increases | The relay rejected active-WebSocket admission; users are affected |
 
 ### 3. Check Machine events and logs
 
@@ -153,7 +164,7 @@ several seconds apart. Ingress reservations and in-flight delivery bytes must
 remain under their configured ceilings. Backpressured sources that drain with
 readiness intact and no timeout growth are transient. Sustained pressure,
 increasing timeouts/slow-consumer closes, readiness loss, or increasing
-rejections is actionable.
+connection rejections is actionable.
 
 ## Verdicts
 
@@ -163,8 +174,8 @@ Use a short verdict and evidence, not a wall of telemetry:
   rejections; targeted queues are stable.
 - **WATCH:** one weak or transient signal without user impact. Re-sample; do not
   alert or intervene merely because a Machine is busy.
-- **INCIDENT:** repeated readiness failure, OOM/exit, sustained relay
-  pressure, unreachable owner, or increasing rejection counter.
+- **INCIDENT:** repeated readiness failure, OOM/exit, sustained relay pressure,
+  an unreachable owner, or an increasing rejection counter.
 
 Confirm an incident with repeated probes or two independent signals, except for
 an explicit OOM or Machine exit, which is already concrete evidence.

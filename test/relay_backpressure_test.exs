@@ -4,10 +4,16 @@ defmodule PaseoRelay.BackpressureTest do
 
   @frame_bytes 4 * 1024 * 1024
   @pressure_frame_bytes 8 * 1024 * 1024
-  @maximum_frame_payload_bytes PaseoRelay.Protocol.maximum_client_frame_payload_bytes()
+  @maximum_frame_wire_bytes 32 * 1024 * 1024
+  @maximum_client_frame_header_bytes 14
+  @maximum_client_frame_payload_bytes @maximum_frame_wire_bytes -
+                                        @maximum_client_frame_header_bytes
   @maximum_message_payload_bytes PaseoRelay.Protocol.maximum_message_payload_bytes()
 
   setup do
+    {:ok, resources} = Agent.start(fn -> [] end)
+    Process.put(:relay_test_resources, resources)
+
     baseline = %{
       active_websockets: 0,
       backpressured_sources: 0,
@@ -16,7 +22,20 @@ defmodule PaseoRelay.BackpressureTest do
     }
 
     await_transient_gauges(baseline)
-    on_exit(fn -> await_transient_gauges(baseline) end)
+
+    on_exit(fn ->
+      tracked = Agent.get(resources, & &1)
+      {listeners, connections} = Enum.split_with(tracked, &match?({:listener, _}, &1))
+
+      {raw_sockets, managed_clients} =
+        Enum.split_with(connections, &match?({:socket, _}, &1))
+
+      Enum.each(raw_sockets, &stop_resource/1)
+      Enum.each(managed_clients, &stop_resource/1)
+      await_transient_gauges(baseline)
+      Enum.each(listeners, &stop_resource/1)
+      if Process.alive?(resources), do: Agent.stop(resources)
+    end)
 
     :ok
   end
@@ -40,6 +59,8 @@ defmodule PaseoRelay.BackpressureTest do
       send(owner, {:relay_closed, self(), reason})
       {:ok, owner}
     end
+
+    def handle_cast(:close, owner), do: {:close, owner}
   end
 
   defmodule DigestClient do
@@ -60,6 +81,8 @@ defmodule PaseoRelay.BackpressureTest do
 
       {:ok, owner}
     end
+
+    def handle_cast(:close, owner), do: {:close, owner}
   end
 
   test "a client frame waits without buffering until daemon data attaches" do
@@ -80,30 +103,28 @@ defmodule PaseoRelay.BackpressureTest do
     assert_receive {:relay_frame, ^destination, :text, "first"}
     assert_receive {:relay_frame, ^destination, :binary, "second"}
     await_metric(:backpressured_sources, &(&1 == 0))
+    stop_resource({:client, destination})
+    close_raw(source)
+    await_metric(:active_websockets, &(&1 == 0))
   end
 
   @tag timeout: 20_000
   test "a passive destination bounds relay payloads and stalls the source TCP sender" do
-    previous = Application.fetch_env!(:paseo_relay, :operations)
-
-    Application.put_env(
-      :paseo_relay,
-      :operations,
-      Keyword.put(previous, :delivery_timeout_ms, 500)
-    )
-
-    on_exit(fn -> Application.put_env(:paseo_relay, :operations, previous) end)
-
-    port = start_relay(send_timeout: 1_000)
+    port = start_relay(delivery_timeout: 500, send_timeout: 1_000)
     active_baseline = PaseoRelay.Metrics.value(:active_websockets)
     slow_baseline = PaseoRelay.Metrics.value(:slow_consumer_disconnects)
-    _destination = raw_connect(port, "/ws?serverId=pressure-#{port}&role=server")
+    destination = raw_connect(port, "/ws?serverId=pressure-#{port}&role=server")
     source = raw_connect(port, "/ws?serverId=pressure-#{port}&role=client")
     payload = :binary.copy(<<42>>, @frame_bytes)
 
     sender =
       Task.async(fn ->
-        Enum.each(1..32, fn _ -> :ok = send_frame(source, :binary, payload) end)
+        Enum.reduce_while(1..32, :ok, fn _, _result ->
+          case send_frame(source, :binary, payload) do
+            :ok -> {:cont, :ok}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
       end)
 
     await_metric(:backpressured_sources, &(&1 >= 1))
@@ -113,48 +134,122 @@ defmodule PaseoRelay.BackpressureTest do
     await_metric(:slow_consumer_disconnects, &(&1 == slow_baseline + 1))
     await_metric(:backpressured_sources, &(&1 == 0))
     await_metric(:inflight_delivery_bytes, &(&1 == 0))
+    close_raw(source)
+    close_raw(destination)
+    _ = Task.await(sender, 5_000)
     await_metric(:active_websockets, &(&1 == active_baseline))
     await_reserved(&(&1 == 0))
-
-    _ = Task.yield(sender, 5_000) || Task.shutdown(sender, :brutal_kill)
   end
 
-  @tag timeout: 20_000
-  test "frame headers reserve a strict node budget before payload bytes are read" do
-    previous = Application.fetch_env!(:paseo_relay, :operations)
+  @tag timeout: 45_000
+  test "suspended source reads leave outbound Writer delivery live" do
+    port = start_relay(delivery_timeout: 15_000, send_timeout: 20_000, send_buffer: 1024)
+    server_id = "full-duplex-#{port}"
 
-    Application.put_env(
-      :paseo_relay,
-      :operations,
-      Keyword.put(previous, :payload_timeout_ms, 200)
-    )
+    slow = raw_connect(port, "/ws?serverId=#{server_id}&role=client&v=2&connectionId=shared")
+    {:ok, healthy} = connect(v2_url(port, server_id, "client", "shared"))
+    assert_receive {:relay_open, ^healthy}
+    daemon = raw_connect(port, "/ws?serverId=#{server_id}&role=server&v=2&connectionId=shared")
+    payload = :binary.copy(<<0x2A>>, @pressure_frame_bytes)
 
-    on_exit(fn -> Application.put_env(:paseo_relay, :operations, previous) end)
+    sender =
+      Task.async(fn ->
+        Enum.reduce_while(1..32, :ok, fn _, _result ->
+          case send_frame(daemon, :binary, payload) do
+            :ok -> {:cont, :ok}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+      end)
 
-    port = start_relay()
+    await_stable_metric(:backpressured_sources, &(&1 == 1), 250)
+    :ok = WebSockex.send_frame(healthy, {:text, "reverse-during-pressure"})
+    assert {:text, "reverse-during-pressure"} = recv_server_frame(daemon)
+    await_stable_metric(:backpressured_sources, &(&1 == 1), 250)
+
+    close_raw(slow)
+    close_raw(daemon)
+    _ = Task.await(sender, 10_000)
+    stop_resource({:client, healthy})
+    await_metric(:backpressured_sources, &(&1 == 0))
+    await_reserved(&(&1 == 0))
+  end
+
+  @tag timeout: 90_000
+  test "completed messages cannot exceed the strict node byte budget" do
+    port = start_relay(data_attach_timeout: 60_000)
     baseline = PaseoRelay.Metrics.value(:active_websockets)
+    payload = :binary.copy(<<0x5A>>, @maximum_message_payload_bytes)
 
     sockets =
       Enum.map(1..5, fn index ->
-        raw_connect(port, "/ws?serverId=budget-#{port}-#{index}&role=server")
+        raw_connect(
+          port,
+          "/ws?serverId=budget-#{port}-#{index}&role=client&v=2&connectionId=missing"
+        )
       end)
 
     await_metric(:active_websockets, &(&1 == baseline + 5))
 
-    Enum.each(sockets, &send_frame_header(&1, :binary, @maximum_frame_payload_bytes))
-    limit = 512 * 1024 * 1024
-    await_reserved(&(&1 > 500 * 1024 * 1024))
-
-    assert PaseoRelay.Delivery.Budget.reserved_bytes() <= limit
-    assert PaseoRelay.Delivery.Budget.reserved_bytes() <= limit
-
     Enum.each(Enum.take(sockets, 4), fn socket ->
-      assert {:close, 1013, "Payload completion timeout"} = recv_server_frame(socket)
+      assert :ok = send_frame(socket, :binary, payload)
     end)
 
-    assert {:close, 1013, "Payload completion timeout"} = recv_server_frame(List.last(sockets))
-    await_metric(:active_websockets, &(&1 == baseline))
+    limit = @maximum_message_payload_bytes * 4 * 4
+    await_reserved(&(&1 == limit))
+    assert PaseoRelay.Delivery.Budget.reserved_bytes() == limit
+
+    rejected = List.last(sockets)
+    assert :ok = send_frame(rejected, :binary, payload)
+    assert {:close, 1013, "Relay ingress capacity"} = recv_server_frame(rejected)
+    assert PaseoRelay.Delivery.Budget.reserved_bytes() == limit
+
+    digest = :crypto.hash(:sha256, payload)
+
+    destinations =
+      Enum.map(1..4, fn index ->
+        destination =
+          digest_connect(v2_url(port, "budget-#{port}-#{index}", "server", "missing"))
+
+        assert_receive {:digest_frame, ^destination, :binary, @maximum_message_payload_bytes,
+                        ^digest},
+                       15_000
+
+        destination
+      end)
+
     await_reserved(&(&1 == 0))
+    Enum.each(Enum.take(sockets, 4), &close_raw/1)
+    Enum.each(destinations, &stop_resource({:client, &1}))
+    await_metric(:active_websockets, &(&1 == baseline))
+  end
+
+  test "pipelined frames retain order and reserve one active delivery" do
+    port = start_relay()
+    server_id = "pipelined-#{port}"
+    payloads = Enum.map(1..3, &<<&1, :binary.copy(<<&1>>, 1024 * 1024 - 1)::binary>>)
+
+    source =
+      raw_connect(port, "/ws?serverId=#{server_id}&role=client&v=2&connectionId=shared")
+
+    baseline = PaseoRelay.Delivery.Budget.reserved_bytes()
+    assert :ok = send_frames(source, Enum.map(payloads, &{:binary, &1}))
+
+    expected = baseline + byte_size(hd(payloads)) * 4
+    await_reserved(&(&1 == expected))
+    assert PaseoRelay.Delivery.Budget.reserved_bytes() == expected
+
+    {:ok, destination} = connect(v2_url(port, server_id, "server", "shared"))
+    assert_receive {:relay_open, ^destination}
+
+    Enum.each(payloads, fn payload ->
+      assert_receive {:relay_frame, ^destination, :binary, ^payload}, 5_000
+      assert PaseoRelay.Delivery.Budget.reserved_bytes() <= expected
+    end)
+
+    await_reserved(&(&1 == baseline))
+    close_raw(source)
+    await_metric(:active_websockets, &(&1 == 0))
   end
 
   @tag timeout: 30_000
@@ -163,15 +258,18 @@ defmodule PaseoRelay.BackpressureTest do
     server_id = "maximum-frame-#{port}"
     destination = digest_connect(v2_url(port, server_id, "server", "shared"))
     source = raw_connect(port, "/ws?serverId=#{server_id}&role=client&v=2&connectionId=shared")
-    payload = :binary.copy(<<0xA5>>, @maximum_frame_payload_bytes)
+    payload = :binary.copy(<<0xA5>>, @maximum_client_frame_payload_bytes)
     digest = :crypto.hash(:sha256, payload)
 
     assert :ok = send_frame(source, :binary, payload)
 
-    assert_receive {:digest_frame, ^destination, :binary, @maximum_frame_payload_bytes, ^digest},
+    assert_receive {:digest_frame, ^destination, :binary, @maximum_client_frame_payload_bytes,
+                    ^digest},
                    15_000
 
     await_reserved(&(&1 == 0))
+    close_raw(source)
+    await_metric(:active_websockets, &(&1 == 0))
   end
 
   @tag timeout: 30_000
@@ -193,110 +291,34 @@ defmodule PaseoRelay.BackpressureTest do
                    15_000
 
     await_reserved(&(&1 == 0))
+    close_raw(source)
+    await_metric(:active_websockets, &(&1 == 0))
   end
 
-  @tag timeout: 20_000
-  test "a complete non-final fragment expires its assembly and releases ingress" do
-    previous = Application.fetch_env!(:paseo_relay, :operations)
-
-    Application.put_env(
-      :paseo_relay,
-      :operations,
-      Keyword.put(previous, :payload_timeout_ms, 2_000)
-    )
-
-    on_exit(fn -> Application.put_env(:paseo_relay, :operations, previous) end)
-
+  test "incomplete fragments remain outside relay admission at the public Cowboy boundary" do
     port = start_relay()
-    server_id = "stalled-fragment-#{port}"
-    {:ok, destination} = connect(v2_url(port, server_id, "server", "shared"))
-    assert_receive {:relay_open, ^destination}
-
-    stalled =
-      raw_connect(port, "/ws?serverId=#{server_id}&role=client&v=2&connectionId=shared")
-
+    source = raw_connect(port, "/ws?serverId=incomplete-fragment-#{port}&role=server")
     baseline = PaseoRelay.Delivery.Budget.reserved_bytes()
-    fragment = :binary.copy(<<0x7A>>, 8 * 1024 * 1024)
-    assert :ok = send_raw_frame(stalled, 0x2, fragment, false)
-    assert :ok = send_raw_frame(stalled, 0x9, "fragment-parsed", true)
-    assert {:pong, "fragment-parsed"} = recv_server_frame(stalled)
-    await_reserved(&(&1 == baseline + byte_size(fragment) * 4))
+    fragment = :binary.copy(<<0x7A>>, 1024 * 1024)
 
-    assert {:close, 1013, "Payload completion timeout"} = recv_server_frame(stalled)
-    await_reserved(&(&1 == baseline))
+    assert :ok = send_raw_frame(source, 0x2, fragment, false)
+    assert :ok = send_raw_frame(source, 0x9, "before-wait", true)
+    assert {:pong, "before-wait"} = recv_server_frame(source)
+    Process.sleep(250)
+    assert PaseoRelay.Delivery.Budget.reserved_bytes() == baseline
+    assert :ok = send_raw_frame(source, 0x9, "after-wait", true)
+    assert {:pong, "after-wait"} = recv_server_frame(source)
 
-    legitimate_server_id = "after-stalled-fragment-#{port}"
-
-    {:ok, legitimate_destination} =
-      connect(v2_url(port, legitimate_server_id, "server", "shared"))
-
-    assert_receive {:relay_open, ^legitimate_destination}
-
-    legitimate =
-      raw_connect(
-        port,
-        "/ws?serverId=#{legitimate_server_id}&role=client&v=2&connectionId=shared"
-      )
-
-    assert :ok = send_frame(legitimate, :text, "after-stalled-fragment")
-
-    assert_receive {:relay_frame, ^legitimate_destination, :text, "after-stalled-fragment"}, 5_000
+    close_raw_websocket(source)
     await_reserved(&(&1 == baseline))
   end
 
-  test "an oversized message is rejected before reserving ingress" do
+  test "Cowboy rejects a frame one byte over the 32 MiB wire ceiling with 1009" do
     port = start_relay()
     source = raw_connect(port, "/ws?serverId=oversize-#{port}&role=server")
 
-    assert :ok = send_frame_header(source, :binary, @maximum_frame_payload_bytes + 1)
+    assert :ok = send_frame_header(source, :binary, @maximum_client_frame_payload_bytes + 1)
     assert {:close, 1009, _reason} = recv_server_frame(source)
-    await_reserved(&(&1 == 0))
-  end
-
-  @tag timeout: 30_000
-  test "advertised payloads expire and release admission to queued legitimate traffic" do
-    previous = Application.fetch_env!(:paseo_relay, :operations)
-
-    Application.put_env(
-      :paseo_relay,
-      :operations,
-      Keyword.put(previous, :payload_timeout_ms, 200)
-    )
-
-    on_exit(fn -> Application.put_env(:paseo_relay, :operations, previous) end)
-
-    port = start_relay()
-    server_id = "queued-legitimate-#{port}"
-    destination = digest_connect(v2_url(port, server_id, "server", "shared"))
-    source = raw_connect(port, "/ws?serverId=#{server_id}&role=client&v=2&connectionId=shared")
-    payload = :binary.copy(<<0x6D>>, @maximum_frame_payload_bytes)
-    digest = :crypto.hash(:sha256, payload)
-
-    stalled =
-      Enum.map(1..4, fn index ->
-        raw_connect(port, "/ws?serverId=stalled-#{port}-#{index}&role=server")
-      end)
-
-    Enum.each(stalled, fn socket ->
-      :ok = send_frame_header(socket, :binary, @maximum_frame_payload_bytes)
-    end)
-
-    await_reserved(&(&1 == @maximum_frame_payload_bytes * 4 * 4))
-
-    sender = Task.async(fn -> send_frame(source, :binary, payload) end)
-
-    refute_receive {:digest_frame, ^destination, :binary, @maximum_frame_payload_bytes, ^digest},
-                   50
-
-    Enum.each(stalled, fn socket ->
-      assert {:close, 1013, "Payload completion timeout"} = recv_server_frame(socket)
-    end)
-
-    assert :ok = Task.await(sender, 15_000)
-
-    assert_receive {:digest_frame, ^destination, :binary, @maximum_frame_payload_bytes, ^digest},
-                   15_000
-
     await_reserved(&(&1 == 0))
   end
 
@@ -335,22 +357,23 @@ defmodule PaseoRelay.BackpressureTest do
            |> Map.values()
            |> Enum.all?(&(&1 == Enum.to_list(1..20)))
 
-    Enum.each(sources, &GenServer.stop/1)
+    Enum.each(sources, &stop_resource({:client, &1}))
   end
 
   test "control notifications retain the forwarded metric contract" do
     port = start_relay()
     server_id = "control-metrics-#{port}"
+    active_baseline = PaseoRelay.Metrics.value(:active_websockets)
     frames_baseline = PaseoRelay.Metrics.value(:frames_forwarded)
     bytes_baseline = PaseoRelay.Metrics.value(:bytes_forwarded)
 
-    {:ok, control} = connect(v2_url(port, server_id, "server", ""))
-    assert_receive {:relay_open, ^control}
-    assert_receive {:relay_frame, ^control, :text, sync}
+    control = raw_connect(port, "/ws?serverId=#{server_id}&role=server&v=2")
+    assert {:text, sync} = recv_server_frame(control)
 
-    {:ok, client} = connect(v2_url(port, server_id, "client", "shared"))
-    assert_receive {:relay_open, ^client}
-    assert_receive {:relay_frame, ^control, :text, connected}
+    client =
+      raw_connect(port, "/ws?serverId=#{server_id}&role=client&v=2&connectionId=shared")
+
+    assert {:text, connected} = recv_server_frame(control)
 
     assert Jason.decode!(sync) == %{"connectionIds" => [], "type" => "sync"}
     assert Jason.decode!(connected) == %{"connectionId" => "shared", "type" => "connected"}
@@ -358,19 +381,77 @@ defmodule PaseoRelay.BackpressureTest do
 
     expected_bytes = bytes_baseline + byte_size(sync) + byte_size(connected)
     await_metric(:bytes_forwarded, &(&1 == expected_bytes))
+
+    close_raw_websocket(control)
+    close_raw_websocket(client)
+    await_metric(:active_websockets, &(&1 == active_baseline))
+  end
+
+  @tag timeout: 60_000
+  test "an unread control socket is shed through its bounded Writer" do
+    port =
+      start_relay(
+        control_queue: 64,
+        delivery_timeout: 500,
+        send_timeout: 1_000,
+        send_buffer: 1024
+      )
+
+    server_id = "slow-control-#{port}"
+    active_baseline = PaseoRelay.Metrics.value(:active_websockets)
+
+    clients =
+      Enum.map(1..1_000, fn index ->
+        connection_id = index |> Integer.to_string() |> String.pad_trailing(256, "x")
+
+        raw_connect(
+          port,
+          "/ws?serverId=#{server_id}&role=client&v=2&connectionId=#{connection_id}"
+        )
+      end)
+
+    control = raw_connect(port, "/ws?serverId=#{server_id}&role=server&v=2")
+
+    resources = Process.get(:relay_test_resources)
+
+    burst_clients =
+      1..100
+      |> Task.async_stream(
+        fn index ->
+          Process.put(:relay_test_resources, resources)
+
+          raw_connect(
+            port,
+            "/ws?serverId=#{server_id}&role=client&v=2&connectionId=#{String.pad_trailing("z#{index}", 256, "z")}"
+          )
+        end,
+        max_concurrency: 100,
+        timeout: 10_000,
+        ordered: false
+      )
+      |> Enum.map(fn {:ok, socket} -> socket end)
+
+    assert {:close, 1013, "Slow consumer"} = recv_until_close(control)
+    Enum.each(burst_clients ++ clients, &close_raw/1)
+    close_raw(control)
+    await_metric(:active_websockets, &(&1 == active_baseline))
+  end
+
+  test "a Writer crash closes its real Cowboy websocket" do
+    existing = writer_processes()
+    port = start_relay()
+    {:ok, socket} = connect("ws://127.0.0.1:#{port}/ws?serverId=writer-death-#{port}&role=server")
+    assert_receive {:relay_open, ^socket}
+
+    writer = await_new_writer(existing)
+    Process.exit(writer, :kill)
+
+    assert_receive {:relay_closed, ^socket, {:remote, 1013, "Delivery unavailable"}}, 2_000
   end
 
   test "the node watermark explicitly closes the oldest blocked source" do
-    previous = Application.fetch_env!(:paseo_relay, :operations)
-
-    Application.put_env(
-      :paseo_relay,
-      :operations,
-      Keyword.put(previous, :memory_watermark_bytes, 1)
-    )
-
-    on_exit(fn -> Application.put_env(:paseo_relay, :operations, previous) end)
-
+    reconfigure_pressure(1)
+    on_exit(fn -> reconfigure_pressure(0) end)
     port = start_relay()
     baseline = PaseoRelay.Metrics.value(:active_websockets)
     {:ok, source} = connect(v2_url(port, "watermark-#{port}", "client", "missing"))
@@ -387,18 +468,52 @@ defmodule PaseoRelay.BackpressureTest do
     await_reserved(&(&1 == 0))
   end
 
-  test "a missing daemon data route expires with an explicit retryable close" do
-    previous = Application.fetch_env!(:paseo_relay, :operations)
-
-    Application.put_env(
-      :paseo_relay,
-      :operations,
-      Keyword.put(previous, :data_attach_timeout_ms, 100)
-    )
-
-    on_exit(fn -> Application.put_env(:paseo_relay, :operations, previous) end)
-
+  test "the node watermark closes an incomplete fragmented-message source" do
+    reconfigure_pressure(1)
+    on_exit(fn -> reconfigure_pressure(0) end)
     port = start_relay()
+    baseline = PaseoRelay.Metrics.value(:active_websockets)
+    reserved = PaseoRelay.Delivery.Budget.reserved_bytes()
+    source = raw_connect(port, "/ws?serverId=fragment-watermark-#{port}&role=server")
+    fragment = :binary.copy(<<0x6B>>, 1024 * 1024)
+
+    await_metric(:active_websockets, &(&1 == baseline + 1))
+    assert :ok = send_raw_frame(source, 0x2, fragment, false)
+    assert :ok = PaseoRelay.Delivery.Pressure.check_now()
+
+    assert {:close, 1013, "Relay memory pressure"} = recv_until_close(source)
+    await_metric(:active_websockets, &(&1 == baseline))
+    await_reserved(&(&1 == reserved))
+  end
+
+  test "an ingress budget restart fails existing Cowboy sockets closed" do
+    port = start_relay()
+    baseline = PaseoRelay.Metrics.value(:active_websockets)
+    {:ok, socket} = connect("ws://127.0.0.1:#{port}/ws?serverId=budget-death-#{port}&role=server")
+    assert_receive {:relay_open, ^socket}
+    await_metric(:active_websockets, &(&1 == baseline + 1))
+
+    old_budget = Process.whereis(PaseoRelay.Delivery.Budget)
+    Process.exit(old_budget, :kill)
+
+    assert_receive {:relay_closed, ^socket,
+                    {:remote, 1013, "Relay ingress capacity unavailable"}},
+                   2_000
+
+    new_budget = await_replacement(PaseoRelay.Delivery.Budget, old_budget)
+    assert is_pid(new_budget)
+    await_metric(:active_websockets, &(&1 == baseline))
+
+    {:ok, replacement} =
+      connect("ws://127.0.0.1:#{port}/ws?serverId=budget-after-#{port}&role=server")
+
+    assert_receive {:relay_open, ^replacement}
+    stop_resource({:client, replacement})
+    await_metric(:active_websockets, &(&1 == baseline))
+  end
+
+  test "a missing daemon data route expires with an explicit retryable close" do
+    port = start_relay(data_attach_timeout: 100)
     baseline = PaseoRelay.Metrics.value(:active_websockets)
     {:ok, source} = connect(v2_url(port, "attach-timeout-#{port}", "client", "missing"))
     assert_receive {:relay_open, ^source}
@@ -420,18 +535,20 @@ defmodule PaseoRelay.BackpressureTest do
 
     sources =
       Enum.map(1..5, fn _ ->
-        {:ok, source} = connect(v2_url(port, server_id, "client", "shared"))
-        assert_receive {:relay_open, ^source}
-        source
+        raw_connect(port, "/ws?serverId=#{server_id}&role=client&v=2&connectionId=shared")
       end)
 
-    payload = :binary.copy(<<13>>, 16 * 1024 * 1024)
-    Enum.each(sources, &WebSockex.send_frame(&1, {:binary, payload}))
+    await_metric(:active_websockets, &(&1 == baseline + 6))
+    frame_count = PaseoRelay.Metrics.value(:frame_size_count)
+    payload = :binary.copy(<<13>>, @frame_bytes)
+    Enum.each(sources, fn source -> assert :ok = send_frame(source, :binary, payload) end)
+    await_metric(:frame_size_count, &(&1 == frame_count + length(sources)))
     await_metric(:backpressured_sources, &(&1 >= 1))
+
     :gen_tcp.close(destination)
 
     Enum.each(sources, fn source ->
-      assert_receive {:relay_closed, ^source, {:remote, code, reason}}, 5_000
+      assert {:close, code, reason} = recv_until_close(source)
       assert {code, reason} in [{1012, "Server disconnected"}, {1013, "Delivery unavailable"}]
     end)
 
@@ -459,26 +576,19 @@ defmodule PaseoRelay.BackpressureTest do
     assert_receive {:relay_frame, ^second, :text, ^payload}
     await_metric(:frames_forwarded, &(&1 == frames_baseline + 2))
     await_metric(:bytes_forwarded, &(&1 == bytes_baseline + 2 * byte_size(payload)))
+
+    Enum.each([first, second, daemon], &stop_resource({:client, &1}))
+    await_metric(:active_websockets, &(&1 == 0))
   end
 
   @tag timeout: 45_000
   test "a real unread fanout peer reaches its send deadline without delaying healthy order" do
-    previous = Application.fetch_env!(:paseo_relay, :operations)
-
-    Application.put_env(
-      :paseo_relay,
-      :operations,
-      Keyword.put(previous, :delivery_timeout_ms, 500)
-    )
-
-    on_exit(fn -> Application.put_env(:paseo_relay, :operations, previous) end)
-
     # The Writer deadline fires first; the blocked real TCP send then reaches
     # its own transport deadline before the connection can finish cleanup.
-    port = start_relay(send_timeout: 1_000)
+    port = start_relay(delivery_timeout: 500, send_timeout: 1_000)
     server_id = "fanout-#{port}"
     active_baseline = PaseoRelay.Metrics.value(:active_websockets)
-    _slow = raw_connect(port, "/ws?serverId=#{server_id}&role=client&v=2&connectionId=shared")
+    slow = raw_connect(port, "/ws?serverId=#{server_id}&role=client&v=2&connectionId=shared")
     await_metric(:active_websockets, &(&1 == active_baseline + 1))
     {:ok, healthy} = connect(v2_url(port, server_id, "client", "shared"))
     assert_receive {:relay_open, ^healthy}
@@ -492,27 +602,37 @@ defmodule PaseoRelay.BackpressureTest do
 
     :ok = send_frame(daemon, :text, "after-slow-client")
     assert_receive {:relay_frame, ^healthy, :text, "after-slow-client"}, 5_000
+    await_metric(:backpressured_sources, &(&1 == 0))
+    close_raw_websocket(daemon)
+    close_raw(slow)
+    stop_resource({:client, healthy})
+    await_metric(:active_websockets, &(&1 == active_baseline))
   end
 
   defp start_relay(options \\ []) do
     port = available_port()
+    reference = {:backpressure, System.unique_integer([:positive])}
+
+    config =
+      PaseoRelay.Config.normalize(%{
+        PaseoRelay.Config.defaults()
+        | delivery_timeout_ms: Keyword.get(options, :delivery_timeout, 30_000),
+          transport_send_timeout_ms: Keyword.get(options, :send_timeout, 35_000),
+          control_queue_bytes: Keyword.get(options, :control_queue, 1024 * 1024),
+          data_attach_timeout_ms: Keyword.get(options, :data_attach_timeout, 15_000)
+      })
 
     relay =
       start_supervised!(
-        {Bandit,
-         [
-           plug: PaseoRelay.Router,
-           port: port,
-           thousand_island_options: [
-             transport_options: [
-               send_timeout: Keyword.get(options, :send_timeout, 30_000),
-               send_timeout_close: true,
-               recbuf: 64 * 1024,
-               sndbuf: Keyword.get(options, :send_buffer, 1024)
-             ]
-           ],
-           websocket_options: PaseoRelay.Protocol.websocket_options()
-         ]}
+        {PaseoRelay.Listener,
+         ref: reference,
+         config: config,
+         ip: {127, 0, 0, 1},
+         port: port,
+         acceptors: 4,
+         max_connections: 1_000,
+         send_timeout_ms: Keyword.get(options, :send_timeout, 35_000),
+         send_buffer_bytes: Keyword.get(options, :send_buffer, 1024)}
       )
 
     track({:listener, relay})
@@ -580,6 +700,16 @@ defmodule PaseoRelay.BackpressureTest do
     send_raw_frame(socket, opcode, payload, true)
   end
 
+  defp send_frames(socket, frames) do
+    encoded =
+      Enum.map(frames, fn
+        {:text, payload} -> :cow_ws.masked_frame({:text, payload}, 0x11223344)
+        {:binary, payload} -> :cow_ws.masked_frame({:binary, payload}, 0x11223344)
+      end)
+
+    :gen_tcp.send(socket, encoded)
+  end
+
   defp send_ordered_pressure_frames(_source, _destination, sequence, last)
        when sequence > last,
        do: :ok
@@ -595,19 +725,17 @@ defmodule PaseoRelay.BackpressureTest do
   end
 
   defp send_raw_frame(socket, opcode, payload, fin) do
-    mask = 0x11223344
-    masked = Bandit.PrimitiveOps.WebSocket.ws_mask(payload, mask)
-    length = byte_size(payload)
     first = if(fin, do: 0x80, else: 0x00) ||| opcode
 
-    header =
-      cond do
-        length <= 125 -> <<first, 0x80 ||| length>>
-        length <= 65_535 -> <<first, 0x80 ||| 126, length::16>>
-        true -> <<first, 0x80 ||| 127, length::64>>
+    length =
+      case byte_size(payload) do
+        value when value <= 125 -> <<0x80 ||| value>>
+        value when value <= 65_535 -> <<0x80 ||| 126, value::16>>
+        value -> <<0x80 ||| 127, value::64>>
       end
 
-    :gen_tcp.send(socket, [header, <<mask::32>>, masked])
+    # A zero masking key is valid and leaves these large test payloads unchanged.
+    :gen_tcp.send(socket, [<<first>>, length, <<0::32>>, payload])
   end
 
   defp send_frame_header(socket, opcode, length) do
@@ -644,19 +772,105 @@ defmodule PaseoRelay.BackpressureTest do
     end
   end
 
+  defp recv_until_close(socket) do
+    case recv_server_frame(socket) do
+      {:close, _code, _reason} = close -> close
+      _frame -> recv_until_close(socket)
+    end
+  end
+
+  defp writer_processes do
+    Process.list()
+    |> Enum.filter(fn process ->
+      case Process.info(process, :dictionary) do
+        {:dictionary, dictionary} ->
+          dictionary[:"$initial_call"] == {PaseoRelay.Delivery.Writer, :init, 1}
+
+        nil ->
+          false
+      end
+    end)
+    |> MapSet.new()
+  end
+
+  defp await_new_writer(existing) do
+    deadline = System.monotonic_time(:millisecond) + 2_000
+    await_new_writer(existing, deadline)
+  end
+
+  defp await_new_writer(existing, deadline) do
+    writers = writer_processes() |> MapSet.difference(existing) |> MapSet.to_list()
+
+    cond do
+      match?([_writer], writers) ->
+        hd(writers)
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("expected one new Writer, got #{inspect(writers)}")
+
+      true ->
+        receive do
+        after
+          10 -> await_new_writer(existing, deadline)
+        end
+    end
+  end
+
+  defp await_replacement(name, old_process) do
+    deadline = System.monotonic_time(:millisecond) + 2_000
+    await_replacement(name, old_process, deadline)
+  end
+
+  defp await_replacement(name, old_process, deadline) do
+    case Process.whereis(name) do
+      replacement when is_pid(replacement) and replacement != old_process ->
+        replacement
+
+      _missing_or_old ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          flunk("#{inspect(name)} was not replaced")
+        end
+
+        Process.sleep(10)
+        await_replacement(name, old_process, deadline)
+    end
+  end
+
   defp close_raw(socket) do
     :gen_tcp.close(socket)
     :ok
   end
 
+  defp close_raw_websocket(socket) do
+    assert :ok = send_raw_frame(socket, 0x8, <<1000::16>>, true)
+    assert {:close, 1000, _reason} = recv_until_close(socket)
+    close_raw(socket)
+  end
+
   defp track(resource) do
-    on_exit(fn -> stop_resource(resource) end)
+    resources = Process.get(:relay_test_resources) || raise "missing relay test resource tracker"
+    Agent.update(resources, &[resource | &1])
     resource
   end
 
   defp stop_resource({:socket, socket}), do: close_raw(socket)
 
-  defp stop_resource({_kind, pid}) do
+  defp stop_resource({:client, pid}) do
+    if Process.alive?(pid) do
+      reference = Process.monitor(pid)
+      WebSockex.cast(pid, :close)
+
+      receive do
+        {:DOWN, ^reference, :process, ^pid, _reason} -> :ok
+      after
+        5_000 -> flunk("client #{inspect(pid)} did not close its WebSocket synchronously")
+      end
+    end
+  end
+
+  defp stop_resource({_kind, pid}), do: stop_process(pid)
+
+  defp stop_process(pid) do
     if Process.alive?(pid) do
       reference = Process.monitor(pid)
 
@@ -672,6 +886,14 @@ defmodule PaseoRelay.BackpressureTest do
         5_000 -> flunk("resource #{inspect(pid)} did not stop synchronously")
       end
     end
+  end
+
+  defp reconfigure_pressure(watermark) do
+    child = PaseoRelay.Delivery.Pressure
+    :ok = Supervisor.terminate_child(PaseoRelay.Supervisor, child)
+    :ok = Supervisor.delete_child(PaseoRelay.Supervisor, child)
+    {:ok, _process} = Supervisor.start_child(PaseoRelay.Supervisor, {child, watermark})
+    :ok
   end
 
   defp transient_gauges do
@@ -728,6 +950,22 @@ defmodule PaseoRelay.BackpressureTest do
       true ->
         Process.sleep(10)
         await_metric(name, predicate, deadline)
+    end
+  end
+
+  defp await_stable_metric(name, predicate, stable_ms) do
+    deadline = System.monotonic_time(:millisecond) + 5_000
+    await_stable_metric(name, predicate, stable_ms, deadline)
+  end
+
+  defp await_stable_metric(name, predicate, stable_ms, deadline) do
+    await_metric(name, predicate, deadline)
+    Process.sleep(stable_ms)
+
+    if predicate.(PaseoRelay.Metrics.value(name)) do
+      :ok
+    else
+      await_stable_metric(name, predicate, stable_ms, deadline)
     end
   end
 

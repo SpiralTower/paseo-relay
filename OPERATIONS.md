@@ -54,21 +54,28 @@ BEAM node so its frames never cross nodes. Additional Machines increase total
 fleet capacity for new sessions; they cannot split one exceptionally large
 session across Machines.
 
-The listener has a second, provider-independent safety ceiling. Thousand Island
-runs 100 acceptors with 200 connections each by default, for 20,000 live
-connections per node. When one acceptor is full it performs five bounded retries
-one second apart, then closes the new connection and emits
-`paseo_relay_connection_rejections_total`. The values are configurable through
-the generic `PASEO_RELAY_ACCEPTORS`,
-`PASEO_RELAY_CONNECTIONS_PER_ACCEPTOR`,
-`PASEO_RELAY_CONNECTION_RETRY_COUNT`, and
-`PASEO_RELAY_CONNECTION_RETRY_WAIT_MS` settings.
+The relay has a second, provider-independent safety ceiling. The application
+multiplies `PASEO_RELAY_ACCEPTORS` by
+`PASEO_RELAY_CONNECTIONS_PER_ACCEPTOR`, yielding 20,000 active WebSockets per
+node by default. Every valid local upgrade reserves one node-local slot before
+Cowboy takes over the WebSocket. At the ceiling, the upgrade receives `503`,
+`paseo_relay_connection_rejections_total` increments, and existing WebSockets
+remain open. Slots are released explicitly at normal termination and by process
+monitoring after abnormal death.
 
-There is deliberately no application queue for WebSocket upgrades. Holding an
-upgraded socket while ownership work waits would consume the same scarce file
-descriptor and memory and turn overload into an invisible client timeout. The
-listener provides a bounded wait; after that, shedding the connection lets the
-existing client reconnect policy provide backpressure.
+Ranch's own connection accounting is not this safety boundary: Cowboy removes
+an upgraded connection from Ranch accounting at WebSocket takeover. Ranch
+limits only concurrent pre-upgrade HTTP handling and applies TCP backlog
+pressure there. The relay adds no application queue for over-capacity upgrades;
+an explicit retryable rejection is safer than retaining another socket and
+hiding overload as a timeout.
+
+The native-Cowboy capacity run held 15,000 distinct real WebSockets with zero
+failures and measured 1,300,512,768 bytes peak relay RSS on the test host. That
+is the measured real-socket envelope; the generic 20,000-slot ceiling is a
+final admission fuse, not evidence that 20,000 sockets fit every 2 GB runtime.
+Provider limits and machine sizing must stay inside a locally measured envelope
+with room for the configured ingress budget and VM overhead.
 
 ## Failure behavior
 
@@ -114,19 +121,35 @@ existing client reconnect policy provide backpressure.
   pressure, and changing relay size will not repair it.
 - **A destination stops reading:** its Writer permits only one payload write.
   Source reads remain suspended while its WebSocket process can still service
-  full-duplex writes. At the delivery/TCP send deadline the destination
-  receives retryable `1013`, while healthy fanout destinations continue. Increasing
-  `paseo_relay_backpressured_sources` is expected during brief congestion;
-  sustained growth plus delivery timeouts or slow-consumer closes is actionable.
-- **Ingress reaches the node budget:** frame-header admission blocks before
-  payload extraction and `paseo_relay_ingress_reserved_bytes` plateaus at the
-  configured ceiling. Admitted payloads and fragmented-message assemblies that
-  do not complete by their single configured deadline are explicitly closed
-  with `1013`, releasing their reservations to queued peers. Interleaved control
-  frames do not extend that deadline. The generic memory watermark is disabled; deployments that set
-  it must choose a threshold below their runtime memory limit with room for the
-  configured ingress budget and VM overhead. At that watermark, the oldest
-  blocked source is explicitly closed with `1013` until pressure falls.
+  full-duplex writes. The Writer records slow-consumer shedding at its delivery
+  deadline, before the longer TCP send deadline, while healthy fanout
+  destinations continue. A peer that resumes reading in time can receive the
+  queued `1013`; a peer whose TCP receive path remains completely blocked can
+  only observe transport closure because no WebSocket close frame can traverse
+  that blocked path. Increasing `paseo_relay_backpressured_sources` is expected
+  during brief congestion; sustained growth plus delivery timeouts or
+  slow-consumer closes is actionable.
+- **A control destination stops reading:** all control notifications use that
+  destination's Writer. Once its bounded control queue fills, the control socket
+  receives retryable `1013`; notifications cannot accumulate in an unbounded
+  WebSocket mailbox.
+- **Ingress reaches the node budget:** every complete message Cowboy delivers
+  to the relay is charged before relay delivery starts. Frames already buffered
+  when source reads are suspended are also charged and retained in source order.
+  If the weighted total would cross the configured ceiling, that source closes
+  with retryable `1013`; `paseo_relay_ingress_reserved_bytes` never exceeds the
+  ceiling. The masked client-frame wire ceiling remains exactly 32 MiB, so
+  Cowboy bounds each complete or reassembled fragmented message to
+  `32 MiB - 14 bytes` of payload and sends `1009` for one byte more. Bytes
+  belonging to an incomplete fragmented message have not yet crossed the
+  application boundary, so they are protected by Cowboy's message ceiling, the
+  per-WebSocket heap fuse, and the node memory watermark rather than the
+  completed-message budget. The pressure authority monitors every admitted
+  socket, sheds the oldest blocked delivery first, and otherwise closes the
+  oldest active socket—including one assembling an incomplete message—with
+  `1013` until pressure falls. The generic watermark is disabled because the
+  safe threshold depends on the runtime limit; the 2 GB Fly template enables it
+  at 1.5 GB, leaving room for shutdown and reconnect churn.
 - **Two nodes concurrently claim a previously unowned `serverId`:** Syn favors
   availability, so both WebSockets can initially open against different local
   owners. Conflict resolution keeps one owner and closes sockets on the loser

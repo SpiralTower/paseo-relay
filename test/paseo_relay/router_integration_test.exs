@@ -2,17 +2,33 @@ defmodule PaseoRelay.RouterIntegrationTest do
   use ExUnit.Case, async: false
 
   setup do
-    {:ok, listener} = Bandit.start_link(plug: PaseoRelay.Router, ip: {127, 0, 0, 1}, port: 0)
-    Process.unlink(listener)
-    {:ok, {_address, port}} = ThousandIsland.listener_info(listener)
-    on_exit(fn -> if Process.alive?(listener), do: Supervisor.stop(listener) end)
+    assert PaseoRelay.Metrics.value(:active_websockets) == 0
+
+    on_exit(fn ->
+      assert_eventually(fn -> PaseoRelay.Metrics.value(:active_websockets) == 0 end)
+    end)
+
+    reference = {:router_integration, System.unique_integer([:positive])}
+
+    start_supervised!(
+      {PaseoRelay.Listener,
+       ref: reference,
+       config: PaseoRelay.Config.defaults(),
+       ip: {127, 0, 0, 1},
+       port: 0,
+       acceptors: 4,
+       max_connections: 1_000}
+    )
+
+    port = PaseoRelay.Listener.port(reference)
     %{port: port}
   end
 
   test "a locally owned websocket request upgrades", %{port: port} do
+    active_websockets = PaseoRelay.Metrics.value(:active_websockets)
     {socket, response} = open_websocket(port, "srv_local")
     assert "HTTP/1.1 101" <> _ = response
-    :gen_tcp.close(socket)
+    close_websocket(socket, active_websockets)
   end
 
   test "a non-websocket ws request is rejected before it claims session ownership", %{port: port} do
@@ -58,12 +74,16 @@ defmodule PaseoRelay.RouterIntegrationTest do
              )
   end
 
-  test "health is live while readiness blocks new websocket ownership", %{port: port} do
+  test "health is live while readiness blocks new websocket ownership" do
     visible_cluster_size =
       length(:syn.subcluster_nodes(:registry, :paseo_relay_owners)) + 1
 
-    Application.put_env(:paseo_relay, :minimum_cluster_size, visible_cluster_size + 1)
-    on_exit(fn -> Application.delete_env(:paseo_relay, :minimum_cluster_size) end)
+    config = %{
+      PaseoRelay.Config.defaults()
+      | minimum_cluster_size: visible_cluster_size + 1
+    }
+
+    port = start_listener(config)
 
     assert "HTTP/1.1 200" <> _ = request(port, "/health")
     assert "HTTP/1.1 503" <> _ = request(port, "/ready")
@@ -111,7 +131,7 @@ defmodule PaseoRelay.RouterIntegrationTest do
     assert metric_value(metrics, "reroute_responses_total") == before.reroute_responses
     assert metric_value(metrics, "frames_forwarded_total") == before.frames_forwarded + 1
     assert metric_value(metrics, "bytes_forwarded_total") == before.bytes_forwarded + sync_bytes
-    :gen_tcp.close(socket)
+    close_websocket(socket, before.active_websockets)
   end
 
   defp request(port, path, headers \\ []) do
@@ -156,6 +176,32 @@ defmodule PaseoRelay.RouterIntegrationTest do
     {socket, response}
   end
 
+  defp close_websocket(socket, active_websockets) do
+    mask = :crypto.strong_rand_bytes(4)
+    :ok = :gen_tcp.send(socket, <<0x88, 0x80, mask::binary>>)
+
+    assert_eventually(fn ->
+      PaseoRelay.Metrics.value(:active_websockets) == active_websockets
+    end)
+
+    :ok = :gen_tcp.close(socket)
+  end
+
+  defp assert_eventually(check, deadline \\ nil) do
+    deadline = deadline || System.monotonic_time(:millisecond) + 5_000
+
+    if check.() do
+      :ok
+    else
+      if System.monotonic_time(:millisecond) >= deadline do
+        flunk("condition did not become true")
+      end
+
+      Process.sleep(10)
+      assert_eventually(check, deadline)
+    end
+  end
+
   defp metric_value(metrics, name) do
     [_, value] = Regex.run(~r/paseo_relay_#{name} (\d+)/, metrics)
     String.to_integer(value)
@@ -174,12 +220,9 @@ defmodule PaseoRelay.RouterIntegrationTest do
     {:ok, _apps} = :rpc.call(peer_node, :application, :ensure_all_started, [:syn])
     :ok = :rpc.call(peer_node, :syn, :add_node_to_scopes, [[:paseo_relay_owners]])
 
-    :ok =
-      :rpc.call(peer_node, :application, :set_env, [
-        :paseo_relay,
-        :operations,
-        [host: "127.0.0.1", ip: {127, 0, 0, 1}, port: 0, drain: false]
-      ])
+    config = %{PaseoRelay.Config.defaults() | port: 0}
+
+    :ok = :rpc.call(peer_node, :application, :set_env, [:paseo_relay, :runtime, config])
 
     assert {:ok, _apps} = :rpc.call(peer_node, :application, :ensure_all_started, [:paseo_relay])
     {peer, peer_node}
@@ -203,5 +246,21 @@ defmodule PaseoRelay.RouterIntegrationTest do
         Process.sleep(10)
         await_owner(server_id, deadline)
     end
+  end
+
+  defp start_listener(config) do
+    reference = {:router_integration_configured, System.unique_integer([:positive])}
+
+    start_supervised!(
+      {PaseoRelay.Listener,
+       ref: reference,
+       config: config,
+       ip: {127, 0, 0, 1},
+       port: 0,
+       acceptors: 4,
+       max_connections: 1_000}
+    )
+
+    PaseoRelay.Listener.port(reference)
   end
 end

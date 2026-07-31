@@ -9,7 +9,7 @@ defmodule PaseoRelay.Metrics do
     {:reroute_responses, :counter, "reroute_responses_total",
      "WebSocket upgrades rerouted to another owner."},
     {:connection_rejections, :counter, "connection_rejections_total",
-     "Connections rejected because this node reached its listener ceiling."},
+     "WebSocket upgrades rejected at this listener's configured capacity."},
     {:frames_forwarded, :counter, "frames_forwarded_total",
      "WebSocket frames forwarded by this node."},
     {:bytes_forwarded, :counter, "bytes_forwarded_total",
@@ -49,9 +49,10 @@ defmodule PaseoRelay.Metrics do
     {64 * 1024, :frame_size_le_64k, "65536"},
     {1024 * 1024, :frame_size_le_1m, "1048576"},
     {8 * 1024 * 1024, :frame_size_le_8m, "8388608"},
-    {@maximum_message_payload_bytes, :frame_size_le_32m, "33554432"}
+    {@maximum_message_payload_bytes, :frame_size_le_32m,
+     Integer.to_string(@maximum_message_payload_bytes)}
   ]
-  @computed_names ~w(active_sessions max_frame_bytes beam_total_memory beam_process_memory beam_binary_memory beam_ets_memory)a
+  @computed_names ~w(active_websockets active_sessions max_frame_bytes beam_total_memory beam_process_memory beam_binary_memory beam_ets_memory)a
   @counter_names (@metrics |> Enum.map(&elem(&1, 0)) |> Kernel.--(@computed_names)) ++
                    [
                      :delivery_wait_microseconds,
@@ -62,12 +63,11 @@ defmodule PaseoRelay.Metrics do
                    Enum.map(@delivery_buckets, &elem(&1, 1)) ++
                    Enum.map(@frame_buckets, &elem(&1, 1))
 
-  @telemetry_handler {__MODULE__, :listener_ceiling}
-
   def start_link(_options), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
 
   def inc(name, amount \\ 1), do: :counters.add(counters(), index(name), amount)
   def dec(name, amount \\ 1), do: inc(name, -amount)
+  def value(:active_websockets), do: PaseoRelay.ConnectionBudget.active_websockets()
   def value(:active_sessions), do: :syn.local_registry_count(:paseo_relay_owners)
   def value(:beam_total_memory), do: :erlang.memory(:total)
   def value(:beam_process_memory), do: :erlang.memory(:processes)
@@ -114,30 +114,8 @@ defmodule PaseoRelay.Metrics do
   def init(:ok) do
     _ = counters()
     _ = max_frame()
-    _ = :telemetry.detach(@telemetry_handler)
-
-    :ok =
-      :telemetry.attach(
-        @telemetry_handler,
-        [:thousand_island, :acceptor, :spawn_error],
-        &__MODULE__.handle_listener_rejection/4,
-        nil
-      )
-
     {:ok, :metrics}
   end
-
-  def handle_listener_rejection(
-        [:thousand_island, :acceptor, :spawn_error],
-        _measurements,
-        _metadata,
-        nil
-      ) do
-    inc(:connection_rejections)
-  end
-
-  @impl true
-  def terminate(_reason, :metrics), do: :telemetry.detach(@telemetry_handler)
 
   defp counters do
     case :persistent_term.get(__MODULE__, nil) do

@@ -5,10 +5,13 @@ defmodule PaseoRelay.Ownership do
 
   @scope :paseo_relay_owners
 
-  def route(server_id, target) do
+  def route(server_id, target),
+    do: route(server_id, target, configured_minimum_cluster_size())
+
+  def route(server_id, target, minimum_cluster_size) do
     case lookup(server_id) do
       {owner, owner_target} -> route_owner(owner, owner_target)
-      :undefined -> claim_route(server_id, target)
+      :undefined -> claim_route(server_id, target, minimum_cluster_size)
     end
   end
 
@@ -45,15 +48,17 @@ defmodule PaseoRelay.Ownership do
     end
   end
 
-  def ready?,
+  def ready?, do: ready?(configured_minimum_cluster_size())
+
+  def ready?(minimum_cluster_size),
     do:
       length(:syn.subcluster_nodes(:registry, @scope)) + 1 >=
-        Application.get_env(:paseo_relay, :minimum_cluster_size, 1)
+        minimum_cluster_size
 
-  defp claim_route(server_id, target) do
+  defp claim_route(server_id, target, minimum_cluster_size) do
     cond do
       draining?() -> {:unavailable, :draining}
-      not ready?() -> {:unavailable, :cluster}
+      not ready?(minimum_cluster_size) -> {:unavailable, :cluster}
       true -> start_or_route(server_id, target)
     end
   end
@@ -86,12 +91,20 @@ defmodule PaseoRelay.Ownership do
   defp draining? do
     if Process.whereis(PaseoRelay.Drain), do: PaseoRelay.Drain.draining?(), else: false
   end
+
+  defp configured_minimum_cluster_size do
+    :paseo_relay
+    |> Application.get_env(:runtime, PaseoRelay.Config.defaults())
+    |> PaseoRelay.Config.normalize()
+    |> Map.fetch!(:minimum_cluster_size)
+  end
 end
 
 defmodule PaseoRelay.Ownership.Owner do
   use GenServer
 
   alias PaseoRelay.Connection
+  alias PaseoRelay.Delivery.Writer
 
   @reservation_ms 5_000
   @idle_ms 30_000
@@ -106,6 +119,7 @@ defmodule PaseoRelay.Ownership.Owner do
   def attach(owner, reservation, socket, connection, writer),
     do: call(owner, {:attach, reservation, socket, connection, writer})
 
+  def cancel(owner, reservation), do: GenServer.cast(owner, {:cancel, reservation})
   def detach(owner, socket), do: GenServer.cast(owner, {:detach, socket})
   def legacy(owner, socket), do: call(owner, {:legacy, socket})
 
@@ -114,6 +128,8 @@ defmodule PaseoRelay.Ownership.Owner do
   catch
     :exit, _reason -> {:error, :owner_closed}
   end
+
+  def control(owner, socket, payload), do: call(owner, {:control, socket, payload})
 
   @impl true
   def init({server_id, target}) do
@@ -183,6 +199,13 @@ defmodule PaseoRelay.Ownership.Owner do
     {:reply, :ok, %{state | legacy: Process.monitor(socket)}}
   end
 
+  def handle_call({:control, socket, payload}, _from, state) do
+    case get_in(state.sockets, [socket, :writer]) do
+      nil -> {:reply, {:error, :detached}, state}
+      writer -> {:reply, Writer.control(writer, payload), state}
+    end
+  end
+
   defp attach_reservation(state, token, socket, attachment) do
     case Map.pop(state.reservations, token) do
       {nil, _} ->
@@ -211,6 +234,17 @@ defmodule PaseoRelay.Ownership.Owner do
   end
 
   @impl true
+  def handle_cast({:cancel, token}, state) do
+    case Map.pop(state.reservations, token) do
+      {nil, _reservations} ->
+        {:noreply, state}
+
+      {timer, reservations} ->
+        Process.cancel_timer(timer)
+        {:noreply, %{state | reservations: reservations} |> idle_when_empty()}
+    end
+  end
+
   def handle_cast({:detach, socket}, state), do: {:noreply, remove_socket(state, socket)}
 
   @impl true
@@ -232,7 +266,7 @@ defmodule PaseoRelay.Ownership.Owner do
 
   def handle_info({:nudge_control, connection_id}, state) do
     if waiting_for_data?(state, connection_id) do
-      notify(state.control, %{type: "sync", connectionIds: Map.keys(state.clients)})
+      notify(state, state.control, %{type: "sync", connectionIds: Map.keys(state.clients)})
       Process.send_after(self(), {:reset_control, connection_id}, 5_000)
     end
 
@@ -241,7 +275,7 @@ defmodule PaseoRelay.Ownership.Owner do
 
   def handle_info({:reset_control, connection_id}, state) do
     if waiting_for_data?(state, connection_id) do
-      close(state.control, 1011, "Control unresponsive")
+      close(state, state.control, 1011, "Control unresponsive")
     end
 
     {:noreply, state}
@@ -278,7 +312,7 @@ defmodule PaseoRelay.Ownership.Owner do
 
   defp attach_connection(state, socket, %Connection{version: 1} = connection) do
     old = state.v1[connection.role]
-    close(old, 1008, "Replaced by new connection")
+    close(state, old, 1008, "Replaced by new connection")
     %{state | v1: Map.put(state.v1, connection.role, socket)}
   end
 
@@ -287,14 +321,14 @@ defmodule PaseoRelay.Ownership.Owner do
          socket,
          %Connection{version: 2, role: :server, connection_id: ""}
        ) do
-    close(state.control, 1008, "Replaced by new connection")
-    notify(socket, %{type: "sync", connectionIds: Map.keys(state.clients)})
+    close(state, state.control, 1008, "Replaced by new connection")
+    notify(state, socket, %{type: "sync", connectionIds: Map.keys(state.clients)})
     %{state | control: socket}
   end
 
   defp attach_connection(state, socket, %Connection{version: 2, role: :server} = connection) do
     old = state.data[connection.connection_id]
-    close(old, 1008, "Replaced by new connection")
+    close(state, old, 1008, "Replaced by new connection")
 
     state
     |> Map.put(:data, Map.put(state.data, connection.connection_id, socket))
@@ -310,7 +344,7 @@ defmodule PaseoRelay.Ownership.Owner do
         &MapSet.put(&1, socket)
       )
 
-    notify(state.control, %{type: "connected", connectionId: connection.connection_id})
+    notify(state, state.control, %{type: "connected", connectionId: connection.connection_id})
     Process.send_after(self(), {:nudge_control, connection.connection_id}, 10_000)
     %{state | clients: clients}
   end
@@ -329,8 +363,13 @@ defmodule PaseoRelay.Ownership.Owner do
     remaining = MapSet.delete(state.clients[connection.connection_id] || MapSet.new(), socket)
 
     if MapSet.size(remaining) == 0 do
-      close(state.data[connection.connection_id], 1001, "Client disconnected")
-      notify(state.control, %{type: "disconnected", connectionId: connection.connection_id})
+      close(state, state.data[connection.connection_id], 1001, "Client disconnected")
+
+      notify(state, state.control, %{
+        type: "disconnected",
+        connectionId: connection.connection_id
+      })
+
       %{state | clients: Map.delete(state.clients, connection.connection_id)}
     else
       %{state | clients: Map.put(state.clients, connection.connection_id, remaining)}
@@ -344,7 +383,11 @@ defmodule PaseoRelay.Ownership.Owner do
        )
        when connection_id != "" do
     if state.data[connection_id] == socket do
-      Enum.each(state.clients[connection_id] || [], &close(&1, 1012, "Server disconnected"))
+      Enum.each(
+        state.clients[connection_id] || [],
+        &close(state, &1, 1012, "Server disconnected")
+      )
+
       %{state | data: Map.delete(state.data, connection_id)}
     else
       state
@@ -430,15 +473,18 @@ defmodule PaseoRelay.Ownership.Owner do
 
   defp opposite(:server), do: :client
   defp opposite(:client), do: :server
-  defp close(nil, _code, _reason), do: :ok
-  defp close(socket, code, reason), do: send(socket, {:relay_close, code, reason})
-  defp notify(nil, _message), do: :ok
+  defp close(_state, nil, _code, _reason), do: :ok
 
-  defp notify(socket, message) do
+  defp close(state, socket, code, reason) do
+    if writer = get_in(state.sockets, [socket, :writer]), do: Writer.close(writer, code, reason)
+  end
+
+  defp notify(_state, nil, _message), do: :ok
+
+  defp notify(state, socket, message) do
     payload = Jason.encode!(message)
-    PaseoRelay.Metrics.inc(:frames_forwarded)
-    PaseoRelay.Metrics.inc(:bytes_forwarded, byte_size(payload))
-    send(socket, {:relay_control, payload})
+
+    if writer = get_in(state.sockets, [socket, :writer]), do: Writer.control(writer, payload)
   end
 
   defp idle_when_empty(%{reservations: reservations, sockets: sockets} = state)

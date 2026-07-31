@@ -7,56 +7,62 @@ defmodule PaseoRelay.Operations do
   surface. A drain is activated through `PaseoRelay.Drain.begin/0`; it never
   depends on a deployment provider's control plane.
   """
-  use Plug.Router
+  @behaviour :cowboy_handler
 
-  plug(:match)
-  plug(:dispatch)
+  @impl true
+  def init(request, config) do
+    {status, content_type, body} = response(:cowboy_req.path(request), config)
 
-  get "/health" do
-    send_json(conn, 200, "ok")
+    request =
+      :cowboy_req.reply(
+        status,
+        %{"content-type" => content_type},
+        body,
+        request
+      )
+
+    {:ok, request, nil}
   end
 
-  get "/ready" do
-    if ready?(conn) do
-      send_json(conn, 200, "ready")
+  def response(path), do: response(path, configured_runtime())
+
+  def response("/health", _config), do: {200, "application/json", ~s({"status":"ok"})}
+
+  def response("/ready", config) do
+    if ready?(config) do
+      {200, "application/json", ~s({"status":"ready"})}
     else
-      send_json(conn, 503, "unready")
+      {503, "application/json", ~s({"status":"unready"})}
     end
   end
 
-  get "/metrics" do
+  def response("/metrics", config) do
     body =
       [
         "# HELP paseo_relay_ready Whether this node admits new relay work.",
         "# TYPE paseo_relay_ready gauge",
-        "paseo_relay_ready #{if(ready?(conn), do: 1, else: 0)}",
+        "paseo_relay_ready #{if(ready?(config), do: 1, else: 0)}",
         "# HELP paseo_relay_draining Whether this node is draining.",
         "# TYPE paseo_relay_draining gauge",
-        "paseo_relay_draining #{if(draining?(conn), do: 1, else: 0)}",
+        "paseo_relay_draining #{if(draining?(), do: 1, else: 0)}",
         PaseoRelay.Metrics.render()
       ]
       |> Enum.join("\n")
       |> Kernel.<>("\n")
 
-    conn
-    |> put_resp_content_type("text/plain; version=0.0.4")
-    |> send_resp(200, body)
+    {200, "text/plain; version=0.0.4", body}
   end
 
-  match _ do
-    send_resp(conn, 404, "not found\n")
-  end
+  def response(_path, _config), do: {404, "text/plain", "not found\n"}
 
-  defp draining?(conn) do
-    _ = conn
-    PaseoRelay.Drain.draining?()
-  end
+  defp draining?, do: PaseoRelay.Drain.draining?()
 
-  defp ready?(conn), do: not draining?(conn) and PaseoRelay.Ownership.ready?()
+  defp ready?(config),
+    do: not draining?() and PaseoRelay.Ownership.ready?(config.minimum_cluster_size)
 
-  defp send_json(conn, status, state) do
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(status, ~s({"status":"#{state}"}))
+  defp configured_runtime do
+    :paseo_relay
+    |> Application.get_env(:runtime, PaseoRelay.Config.defaults())
+    |> PaseoRelay.Config.normalize()
   end
 end

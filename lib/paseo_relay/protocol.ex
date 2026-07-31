@@ -3,23 +3,15 @@ defmodule PaseoRelay.Protocol do
 
   @maximum_frame_wire_bytes 32 * 1024 * 1024
   @maximum_client_frame_header_bytes 14
-  @maximum_message_payload_bytes 32 * 1024 * 1024
+  @maximum_client_frame_payload_bytes @maximum_frame_wire_bytes -
+                                        @maximum_client_frame_header_bytes
+
+  # Cowboy exposes one payload limit for both individual frames and assembled
+  # fragmented messages. Set it from the stricter masked client-frame contract
+  # so the existing 32 MiB wire ceiling is never exceeded.
+  @maximum_message_payload_bytes @maximum_client_frame_payload_bytes
 
   def maximum_frame_wire_bytes, do: @maximum_frame_wire_bytes
-
-  def maximum_client_frame_payload_bytes,
-    do: @maximum_frame_wire_bytes - @maximum_client_frame_header_bytes
-
+  def maximum_client_frame_payload_bytes, do: @maximum_client_frame_payload_bytes
   def maximum_message_payload_bytes, do: @maximum_message_payload_bytes
-
-  def websocket_options(additional \\ []) do
-    Keyword.merge(
-      [
-        max_frame_size: @maximum_frame_wire_bytes,
-        max_fragmented_message_size: @maximum_message_payload_bytes,
-        compress: false
-      ],
-      additional
-    )
-  end
 end

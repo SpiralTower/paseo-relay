@@ -1,18 +1,22 @@
 defmodule PaseoRelay.LoadClientTest.DelayedRelay do
-  @behaviour Plug
+  @behaviour :cowboy_handler
 
-  @impl Plug
-  def init(options), do: options
+  @impl true
+  def init(request, options) do
+    query = request |> :cowboy_req.parse_qs() |> Map.new()
 
-  @impl Plug
-  def call(conn, options) do
-    conn = Plug.Conn.fetch_query_params(conn)
-
-    if conn.query_params["role"] == "server" && conn.query_params["connectionId"] do
+    if query["role"] == "server" && query["connectionId"] do
       Process.sleep(Keyword.fetch!(options, :delay_ms))
+      send(Keyword.fetch!(options, :owner), {:delayed_connection, self()})
     end
 
-    PaseoRelay.Router.call(conn, [])
+    PaseoRelay.Socket.init(request, %{
+      config: PaseoRelay.Config.defaults(),
+      connection_budget:
+        {Keyword.fetch!(options, :budget_namespace), Keyword.fetch!(options, :max_websockets)},
+      ownership_target: "local",
+      reroute_header: "x-reroute-target"
+    })
   end
 end
 
@@ -20,6 +24,14 @@ defmodule PaseoRelay.LoadClientTest do
   use ExUnit.Case, async: false
 
   setup context do
+    active_websockets = PaseoRelay.Metrics.value(:active_websockets)
+
+    on_exit(fn ->
+      assert_eventually(fn ->
+        PaseoRelay.Metrics.value(:active_websockets) == active_websockets
+      end)
+    end)
+
     if context[:relay] do
       port = available_port()
       relay_pid = start_relay(port, context[:listener] || [])
@@ -49,7 +61,10 @@ defmodule PaseoRelay.LoadClientTest do
     unavailable_port = available_port()
 
     relays = [
-      start_endpoint(PaseoRelay.LoadClientTest.DelayedRelay, relay_port, delay_ms: 500),
+      start_endpoint(PaseoRelay.LoadClientTest.DelayedRelay, relay_port,
+        delay_ms: 500,
+        owner: self()
+      ),
       start_endpoint(PaseoRelay.Operations, unavailable_port, [])
     ]
 
@@ -78,6 +93,9 @@ defmodule PaseoRelay.LoadClientTest do
     assert result["connection_failures"] > 0
     assert result["error"] =~ "non-101 status code"
     assert result["cleanup_timeouts"] == 0
+    assert_receive {:delayed_connection, delayed_connection}, 2_000
+    delayed_connection_ref = Process.monitor(delayed_connection)
+    assert_receive {:DOWN, ^delayed_connection_ref, :process, ^delayed_connection, _reason}, 2_000
     assert metric_value(request(relay_port, "/metrics"), "active_websockets") == 0
   end
 
@@ -205,37 +223,6 @@ defmodule PaseoRelay.LoadClientTest do
            }
   end
 
-  @tag :relay
-  @tag listener: [
-         acceptors: 1,
-         connections_per_acceptor: 2,
-         connection_retry_count: 0,
-         connection_retry_wait_ms: 0
-       ]
-  test "the listener sheds excess websocket upgrades at its configured ceiling", %{port: port} do
-    {output, status} =
-      System.cmd("node", [
-        "scripts/relay-load.mjs",
-        "--endpoints",
-        "ws://127.0.0.1:#{port}/ws",
-        "--scenario",
-        "ownership",
-        "--servers",
-        "3",
-        "--batch-size",
-        "3",
-        "--duration",
-        "0"
-      ])
-
-    result = Jason.decode!(output)
-
-    assert status == 1
-    assert result["connection_successes"] == 2
-    assert result["connection_failures"] > 0
-    assert metric_value(request(port, "/metrics"), "connection_rejections_total") == 1
-  end
-
   defp available_port do
     {:ok, socket} = :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}])
     {:ok, port} = :inet.port(socket)
@@ -244,7 +231,28 @@ defmodule PaseoRelay.LoadClientTest do
   end
 
   defp start_endpoint(module, port, options) do
-    {:ok, endpoint} = Bandit.start_link(plug: {module, options}, port: port)
+    reference = {:load_client_endpoint, System.unique_integer([:positive])}
+    config = PaseoRelay.Config.defaults()
+
+    options =
+      Keyword.merge([budget_namespace: reference, max_websockets: 20_000], options)
+
+    routes =
+      if module == PaseoRelay.Operations do
+        [{:_, module, config}]
+      else
+        [{"/ws", module, options}, {:_, PaseoRelay.Operations, config}]
+      end
+
+    dispatch = :cowboy_router.compile([{:_, routes}])
+
+    {:ok, endpoint} =
+      :cowboy.start_clear(
+        reference,
+        %{num_acceptors: 1, socket_opts: [ip: {127, 0, 0, 1}, port: port]},
+        %{env: %{dispatch: dispatch}}
+      )
+
     Process.unlink(endpoint)
     endpoint
   end
@@ -294,12 +302,15 @@ defmodule PaseoRelay.LoadClientTest do
   end
 
   defp start_relay(port, listener) do
-    operations =
-      [host: "127.0.0.1", ip: {127, 0, 0, 1}, port: port, drain: false] ++ listener
+    runtime =
+      PaseoRelay.Config.defaults()
+      |> Map.from_struct()
+      |> Map.merge(Map.new([port: port] ++ listener))
+      |> PaseoRelay.Config.normalize()
 
     start =
       """
-      Application.put_env(:paseo_relay, :operations, #{inspect(operations)});
+      Application.put_env(:paseo_relay, :runtime, #{inspect(runtime)});
       Application.ensure_all_started(:paseo_relay)
       """
 
@@ -352,6 +363,21 @@ defmodule PaseoRelay.LoadClientTest do
       {_, 0} ->
         Process.sleep(50)
         wait_for_process_exit(pid, attempts - 1)
+    end
+  end
+
+  defp assert_eventually(check, deadline \\ nil) do
+    deadline = deadline || System.monotonic_time(:millisecond) + 5_000
+
+    if check.() do
+      :ok
+    else
+      if System.monotonic_time(:millisecond) >= deadline do
+        flunk("condition did not become true")
+      end
+
+      Process.sleep(10)
+      assert_eventually(check, deadline)
     end
   end
 end

@@ -4,28 +4,7 @@ defmodule PaseoRelay.ConfigTest do
   alias PaseoRelay.Config
 
   test "loads generic release settings with safe local defaults" do
-    assert Config.load([]) ==
-             {:ok,
-              %{
-                host: "127.0.0.1",
-                ip: {127, 0, 0, 1},
-                port: 4000,
-                drain: false,
-                acceptors: 100,
-                connections_per_acceptor: 200,
-                connection_retry_count: 5,
-                connection_retry_wait_ms: 1_000,
-                ingress_budget_bytes: 512 * 1024 * 1024,
-                ingress_weight: 4,
-                delivery_timeout_ms: 30_000,
-                payload_timeout_ms: 30_000,
-                data_attach_timeout_ms: 15_000,
-                tcp_receive_buffer_bytes: 64 * 1024,
-                websocket_max_heap_words: 32 * 1024 * 1024,
-                memory_watermark_bytes: 0,
-                node_name: nil,
-                cookie: nil
-              }}
+    assert Config.load([]) == {:ok, Config.defaults()}
   end
 
   test "rejects a listener hostname that the socket layer cannot bind" do
@@ -70,16 +49,25 @@ defmodule PaseoRelay.ConfigTest do
               ingress_budget_bytes: 256_000_000,
               ingress_weight: 2,
               delivery_timeout_ms: 5_000,
-              payload_timeout_ms: 10_000,
+              transport_send_timeout_ms: 6_000,
+              control_queue_bytes: 1_024,
               tcp_receive_buffer_bytes: 32_768
             }} =
              Config.load([
                {"PASEO_RELAY_INGRESS_BUDGET_BYTES", "256000000"},
                {"PASEO_RELAY_INGRESS_WEIGHT", "2"},
                {"PASEO_RELAY_DELIVERY_TIMEOUT_MS", "5000"},
-               {"PASEO_RELAY_PAYLOAD_TIMEOUT_MS", "10000"},
+               {"PASEO_RELAY_TRANSPORT_SEND_TIMEOUT_MS", "6000"},
+               {"PASEO_RELAY_CONTROL_QUEUE_BYTES", "1024"},
                {"PASEO_RELAY_TCP_RECEIVE_BUFFER_BYTES", "32768"}
              ])
+
+    assert Config.load([
+             {"PASEO_RELAY_DELIVERY_TIMEOUT_MS", "5000"},
+             {"PASEO_RELAY_TRANSPORT_SEND_TIMEOUT_MS", "5000"}
+           ]) ==
+             {:error,
+              "PASEO_RELAY_DELIVERY_TIMEOUT_MS must be lower than PASEO_RELAY_TRANSPORT_SEND_TIMEOUT_MS"}
 
     assert Config.load([
              {"PASEO_RELAY_INGRESS_BUDGET_BYTES", Integer.to_string(128 * 1024 * 1024)},
@@ -95,7 +83,7 @@ defmodule PaseoRelay.ConfigTest do
              Config.load([{"PASEO_RELAY_MEMORY_WATERMARK_BYTES", "1500000000"}])
   end
 
-  test "requires capacity for one maximum assembled fragmented message" do
+  test "requires capacity for one maximum complete message" do
     weight = 5
     exact_budget = PaseoRelay.Protocol.maximum_message_payload_bytes() * weight
 
