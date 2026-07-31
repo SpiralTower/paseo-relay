@@ -521,6 +521,59 @@ defmodule PaseoRelay.BackpressureTest do
     assert_receive {:relay_closed, ^socket, {:remote, 1013, "Delivery unavailable"}}, 2_000
   end
 
+  test "a Writer rejects successors when its active source dies behind a write barrier" do
+    {:ok, writer} = PaseoRelay.Delivery.Writer.start(self(), 5_000, 1024 * 1024)
+    writer_ref = Process.monitor(writer)
+
+    first =
+      Task.async(fn ->
+        with {:ok, token} <-
+               PaseoRelay.Delivery.Writer.reserve(
+                 writer,
+                 5,
+                 PaseoRelay.Delivery.Deadline.after_ms(5_000)
+               ) do
+          PaseoRelay.Delivery.Writer.write(
+            writer,
+            token,
+            :binary,
+            "first",
+            PaseoRelay.Delivery.Deadline.after_ms(5_000)
+          )
+        end
+      end)
+
+    Process.unlink(first.pid)
+    assert_receive {:relay_frame, ^writer, first_reference, :binary, "first"}
+    assert_receive {:relay_write_barrier, ^writer, ^first_reference}
+
+    second =
+      Task.async(fn ->
+        with {:ok, token} <-
+               PaseoRelay.Delivery.Writer.reserve(
+                 writer,
+                 6,
+                 PaseoRelay.Delivery.Deadline.after_ms(5_000)
+               ) do
+          PaseoRelay.Delivery.Writer.write(
+            writer,
+            token,
+            :binary,
+            "second",
+            PaseoRelay.Delivery.Deadline.after_ms(5_000)
+          )
+        end
+      end)
+
+    assert nil == Task.yield(second, 100)
+    Process.exit(first.pid, :kill)
+
+    assert_receive {:relay_close, 1013, "Delivery unavailable"}, 1_000
+    assert_receive {:DOWN, ^writer_ref, :process, ^writer, :normal}, 1_000
+    refute_receive {:relay_frame, ^writer, _reference, :binary, "second"}
+    assert {:error, :source_closed} = Task.await(second, 1_000)
+  end
+
   test "an oversized v2 control message is rejected before JSON parsing" do
     port = start_relay()
     control = raw_connect(port, "/ws?serverId=control-limit-#{port}&role=server&v=2")
@@ -592,6 +645,56 @@ defmodule PaseoRelay.BackpressureTest do
     :ok = PaseoRelay.Delivery.Pressure.check_now()
 
     assert_receive {:relay_closed, ^source, {:remote, 1013, "Relay memory pressure"}}, 2_000
+    await_metric(:active_websockets, &(&1 == baseline))
+    await_metric(:backpressured_sources, &(&1 == 0))
+    await_reserved(&(&1 == 0))
+  end
+
+  @tag timeout: 20_000
+  test "pressure cancellation after a queued write fails the destination closed" do
+    on_exit(fn -> reconfigure_pressure(0) end)
+    port = start_relay(delivery_timeout: 5_000, send_timeout: 6_000, send_buffer: 1024)
+    baseline = PaseoRelay.Metrics.value(:active_websockets)
+    server_id = "cancelled-write-#{port}"
+
+    destination =
+      raw_connect(port, "/ws?serverId=#{server_id}&role=server&v=2&connectionId=shared")
+
+    source =
+      raw_connect(port, "/ws?serverId=#{server_id}&role=client&v=2&connectionId=shared")
+
+    payload = :binary.copy(<<0x51>>, @frame_bytes)
+
+    sender =
+      Task.async(fn ->
+        Enum.reduce_while(1..32, :ok, fn _, _result ->
+          case send_frame(source, :binary, payload) do
+            :ok -> {:cont, :ok}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+      end)
+
+    await_stable_metric(:backpressured_sources, &(&1 == 1), 250)
+
+    padding = :binary.copy(<<0x52>>, 40 * 1024 * 1024)
+    :erlang.garbage_collect(self())
+    reconfigure_pressure(:erlang.memory(:total) - 8 * 1024 * 1024)
+    assert :ok = PaseoRelay.Delivery.Pressure.check_now()
+    assert byte_size(padding) == 40 * 1024 * 1024
+    reconfigure_pressure(0)
+
+    assert {:close, 1013, "Relay memory pressure"} = recv_until_close(source)
+    assert {:close, code, reason} = recv_until_close(destination)
+
+    assert {code, reason} in [
+             {1001, "Client disconnected"},
+             {1013, "Delivery unavailable"}
+           ]
+
+    _ = Task.await(sender, 5_000)
+    close_raw(source)
+    close_raw(destination)
     await_metric(:active_websockets, &(&1 == baseline))
     await_metric(:backpressured_sources, &(&1 == 0))
     await_reserved(&(&1 == 0))

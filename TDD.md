@@ -589,3 +589,12 @@
   all four destinations before awaiting their digests, matching the concurrent
   node-budget behavior under test. The exact 25-test backpressure module passed,
   followed by three isolated passes of the corrected budget regression.
+- Post-barrier source-death red/green: killing the real source process after its
+  Writer had emitted a frame and barrier immediately granted a queued successor;
+  the destination mailbox received a second payload while the first send was
+  still unacknowledged. Writer now distinguishes an unused reservation from an
+  emitted write: source death before emission may advance the queue, while
+  source death behind a barrier sends retryable `1013`, rejects all queued work,
+  and stops. The exact Writer invariant and a real pressure-cancellation socket
+  path passed four consecutive focused runs, the backpressure module passed
+  27/27 at seed `804904`, and the complete local suite passed 80/80 at that seed.

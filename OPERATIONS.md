@@ -125,12 +125,14 @@ with room for the configured ingress budget and VM overhead.
   Source reads remain suspended while its WebSocket process can still service
   full-duplex writes. The Writer records slow-consumer shedding at its delivery
   deadline, before the longer TCP send deadline, while healthy fanout
-  destinations continue. A peer that resumes reading in time can receive the
-  queued `1013`; a peer whose TCP receive path remains completely blocked can
-  only observe transport closure because no WebSocket close frame can traverse
-  that blocked path. Increasing `paseo_relay_backpressured_sources` is expected
-  during brief congestion; sustained growth plus delivery timeouts or
-  slow-consumer closes is actionable.
+  destinations continue. If an active source disappears after its frame reaches
+  the destination write barrier, that Writer fails closed and rejects its queue;
+  it never grants a successor behind the still-outstanding send. A peer that
+  resumes reading in time can receive the queued `1013`; a peer whose TCP
+  receive path remains completely blocked can only observe transport closure
+  because no WebSocket close frame can traverse that blocked path. Increasing
+  `paseo_relay_backpressured_sources` is expected during brief congestion;
+  sustained growth plus delivery timeouts or slow-consumer closes is actionable.
 - **A control destination stops reading:** all control notifications use that
   destination's Writer. Once its bounded control queue fills, the control socket
   receives retryable `1013`; an accepted queued notification that reaches its

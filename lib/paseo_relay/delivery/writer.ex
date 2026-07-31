@@ -133,6 +133,15 @@ defmodule PaseoRelay.Delivery.Writer do
 
   def handle_info(
         {:DOWN, reference, :process, _pid, _reason},
+        %{active: %{source_ref: reference, write_reference: write_reference}} = state
+      )
+      when not is_nil(write_reference) do
+    send(state.destination, {:relay_close, 1013, "Delivery unavailable"})
+    {:stop, :normal, reject_all(state, {:error, :source_closed})}
+  end
+
+  def handle_info(
+        {:DOWN, reference, :process, _pid, _reason},
         %{active: %{source_ref: reference}} = state
       ) do
     continue_or_stop(complete_active(state, {:error, :source_closed}))
