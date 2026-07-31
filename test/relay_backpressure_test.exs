@@ -516,7 +516,6 @@ defmodule PaseoRelay.BackpressureTest do
   end
 
   test "the node watermark explicitly closes the oldest blocked source" do
-    reconfigure_pressure(1)
     on_exit(fn -> reconfigure_pressure(0) end)
     port = start_relay()
     baseline = PaseoRelay.Metrics.value(:active_websockets)
@@ -525,7 +524,7 @@ defmodule PaseoRelay.BackpressureTest do
     await_metric(:active_websockets, &(&1 == baseline + 1))
     :ok = WebSockex.send_frame(source, {:binary, "blocked"})
     await_metric(:backpressured_sources, &(&1 == 1))
-    Process.sleep(20)
+    reconfigure_pressure(1)
     :ok = PaseoRelay.Delivery.Pressure.check_now()
 
     assert_receive {:relay_closed, ^source, {:remote, 1013, "Relay memory pressure"}}, 2_000
@@ -535,7 +534,6 @@ defmodule PaseoRelay.BackpressureTest do
   end
 
   test "the node watermark closes an incomplete fragmented-message source" do
-    reconfigure_pressure(1)
     on_exit(fn -> reconfigure_pressure(0) end)
     port = start_relay()
     baseline = PaseoRelay.Metrics.value(:active_websockets)
@@ -547,6 +545,7 @@ defmodule PaseoRelay.BackpressureTest do
     assert :ok = send_raw_frame(source, 0x2, fragment, false)
     assert :ok = send_raw_frame(source, 0x9, "fragment-retained", true)
     assert {:pong, "fragment-retained"} = recv_server_frame(source)
+    reconfigure_pressure(1)
     assert :ok = PaseoRelay.Delivery.Pressure.check_now()
 
     assert {:close, 1013, "Relay memory pressure"} = recv_until_close(source)

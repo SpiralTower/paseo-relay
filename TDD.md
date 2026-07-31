@@ -217,6 +217,12 @@
   Writer shedding from session-upgrade latency. The focused regression passed
   four consecutive local runs, followed by a 73/73 complete-suite pass in 98.7
   seconds.
+- A subsequent Linux red armed the one-byte watermark before its blocked source
+  existed; the periodic checker correctly shed the new active socket first, so
+  the test never observed one blocked source. Both blocked-delivery and retained-
+  fragment tests now prove their public precondition before enabling pressure and
+  invoking the explicit check. The focused pair passed four consecutive runs
+  without a timing sleep, followed by a 73/73 complete-suite pass in 98.6 seconds.
 
 ### Final standards architectural audit
 
