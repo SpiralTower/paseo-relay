@@ -95,11 +95,15 @@ node scripts/relay-load.mjs \
 docker run --detach --name "${fly_container}" \
   --env FLY_APP_NAME=paseo-relay-ci \
   --env FLY_MACHINE_ID=ci-machine \
+  --env FLY_PRIVATE_IP=::1 \
   --env PASEO_RELAY_HOST=0.0.0.0 \
   --env PASEO_RELAY_PORT=4000 \
   --env PASEO_RELAY_CLUSTER_QUERY=ignore \
   --env PASEO_RELAY_MIN_CLUSTER_SIZE=1 \
   --publish "127.0.0.1:${fly_port}:4000" \
   "${fly_image}" >/dev/null
-wait_for_endpoint "http://127.0.0.1:${fly_port}/health"
+if ! wait_for_endpoint "http://127.0.0.1:${fly_port}/health"; then
+  docker logs "${fly_container}" >&2
+  exit 1
+fi
 assert_operations_contract "http://127.0.0.1:${fly_port}"

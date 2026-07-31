@@ -223,6 +223,15 @@
   fragment tests now prove their public precondition before enabling pressure and
   invoking the explicit check. The focused pair passed four consecutive runs
   without a timing sleep, followed by a 73/73 complete-suite pass in 98.6 seconds.
+- The following hosted run passed all 73 tests, both production relay image
+  builds, the load-client image build, generic-container health/readiness, and
+  the sustained, reconnect, and ownership smokes, then failed only when the Fly
+  adapter container did not become healthy. CI supplied the app and Machine
+  identifiers but omitted Fly's private IPv6 address, leaving the adapter's
+  IPv6 distribution mode without the provider node identity it translates in
+  production. The artifact probe now supplies loopback IPv6 as `FLY_PRIVATE_IP`
+  and prints container logs if readiness fails, exercising the real adapter
+  contract while keeping failures diagnosable.
 
 ### Final standards architectural audit
 
