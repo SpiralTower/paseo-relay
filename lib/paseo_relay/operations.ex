@@ -10,8 +10,8 @@ defmodule PaseoRelay.Operations do
   @behaviour :cowboy_handler
 
   @impl true
-  def init(request, config) do
-    {status, content_type, body} = response(:cowboy_req.path(request), config)
+  def init(request, options) do
+    {status, content_type, body} = response(:cowboy_req.path(request), options)
 
     request =
       :cowboy_req.reply(
@@ -24,28 +24,33 @@ defmodule PaseoRelay.Operations do
     {:ok, request, nil}
   end
 
-  def response(path), do: response(path, configured_runtime())
+  def response(path), do: response(path, operation_options(configured_runtime()))
 
-  def response("/health", _config), do: {200, "application/json", ~s({"status":"ok"})}
+  def response(path, %{minimum_cluster_size: _minimum_cluster_size} = config),
+    do: response(path, operation_options(config))
 
-  def response("/ready", config) do
-    if ready?(config) do
+  def response("/health", _options), do: {200, "application/json", ~s({"status":"ok"})}
+
+  def response("/ready", %{config: config, connection_budget: budget}) do
+    if ready_without_capacity?(config) and ready_capacity?(capacity_status(budget)) do
       {200, "application/json", ~s({"status":"ready"})}
     else
       {503, "application/json", ~s({"status":"unready"})}
     end
   end
 
-  def response("/metrics", config) do
+  def response("/metrics", %{config: config, connection_budget: budget}) do
+    capacity_status = capacity_status(budget)
+
     body =
       [
         "# HELP paseo_relay_ready Whether this node admits new relay work.",
         "# TYPE paseo_relay_ready gauge",
-        "paseo_relay_ready #{if(ready?(config), do: 1, else: 0)}",
+        "paseo_relay_ready #{if(ready?(config, capacity_status), do: 1, else: 0)}",
         "# HELP paseo_relay_draining Whether this node is draining.",
         "# TYPE paseo_relay_draining gauge",
         "paseo_relay_draining #{if(draining?(), do: 1, else: 0)}",
-        PaseoRelay.Metrics.render()
+        PaseoRelay.Metrics.render(capacity_status)
       ]
       |> Enum.join("\n")
       |> Kernel.<>("\n")
@@ -57,8 +62,27 @@ defmodule PaseoRelay.Operations do
 
   defp draining?, do: PaseoRelay.Drain.draining?()
 
-  defp ready?(config),
+  defp ready?(config, capacity_status) do
+    ready_without_capacity?(config) and ready_capacity?(capacity_status)
+  end
+
+  defp ready_without_capacity?(config),
     do: not draining?() and PaseoRelay.Ownership.ready?(config.minimum_cluster_size)
+
+  defp ready_capacity?({:available, %{admission: :open}}), do: true
+  defp ready_capacity?(_unavailable_or_closed), do: false
+
+  defp capacity_status({namespace, limit}), do: PaseoRelay.Capacity.status(namespace, limit)
+
+  defp operation_options(config) do
+    %{
+      config: config,
+      connection_budget: {
+        PaseoRelay.Listener,
+        config.acceptors * config.connections_per_acceptor
+      }
+    }
+  end
 
   defp configured_runtime do
     :paseo_relay

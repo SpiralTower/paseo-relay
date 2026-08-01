@@ -86,9 +86,18 @@ defmodule PaseoRelay.Metrics do
   def value(:max_frame_bytes), do: :atomics.get(max_frame(), 1)
   def value(name), do: :counters.get(counters(), index(name))
 
-  def snapshot do
-    capacity = PaseoRelay.Capacity.snapshot()
-    Map.new(Enum.map(@metrics, &elem(&1, 0)), &{&1, snapshot_value(&1, capacity)})
+  def snapshot, do: snapshot(PaseoRelay.Capacity.snapshot())
+
+  def snapshot(capacity) when is_map(capacity) do
+    @metrics
+    |> Enum.map(&elem(&1, 0))
+    |> Enum.reduce(%{}, fn name, values ->
+      if name in @capacity_names and not Map.has_key?(capacity, name) do
+        values
+      else
+        Map.put(values, name, snapshot_value(name, capacity))
+      end
+    end)
   end
 
   def observe_delivery_wait(native_duration) do
@@ -115,8 +124,18 @@ defmodule PaseoRelay.Metrics do
     put_max_frame(byte_count)
   end
 
-  def render do
-    [render_metrics(snapshot()), render_delivery_histogram(), render_frame_histogram()]
+  def render(capacity_status) do
+    capacity =
+      case capacity_status do
+        {:available, %{gauges: gauges}} -> gauges
+        :unavailable -> %{}
+      end
+
+    [
+      render_metrics(snapshot(capacity)),
+      render_delivery_histogram(),
+      render_frame_histogram()
+    ]
     |> Enum.join("\n")
     |> Kernel.<>("\n")
   end
@@ -168,7 +187,9 @@ defmodule PaseoRelay.Metrics do
   defp index(name), do: Enum.find_index(@counter_names, &(&1 == name)) + 1
 
   defp render_metrics(values) do
-    Enum.map_join(@metrics, "\n", fn {name, type, public_name, help} ->
+    @metrics
+    |> Enum.filter(fn {name, _type, _public_name, _help} -> Map.has_key?(values, name) end)
+    |> Enum.map_join("\n", fn {name, type, public_name, help} ->
       full_name = "paseo_relay_#{public_name}"
 
       [

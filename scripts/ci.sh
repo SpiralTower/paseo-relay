@@ -1,6 +1,43 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+readonly fly_config="deployment/fly/fly.toml"
+
+fly_dockerfile_from_config() {
+  awk '
+    /^\[build\]$/ { in_build = 1; next }
+    /^\[/ { in_build = 0 }
+    in_build && /^[[:space:]]*dockerfile[[:space:]]*=/ {
+      value = $0
+      sub(/^[^=]*=[[:space:]]*"/, "", value)
+      sub(/"[[:space:]]*$/, "", value)
+      print value
+      exit
+    }
+  ' "${fly_config}"
+}
+
+validate_fly_build() {
+  if [[ -z "${fly_dockerfile}" ]]; then
+    echo "${fly_config} must declare [build] dockerfile" >&2
+    return 1
+  fi
+
+  if [[ ! -f "${fly_dockerfile}" ]]; then
+    echo "Fly Dockerfile selected by ${fly_config} does not exist: ${fly_dockerfile}" >&2
+    return 1
+  fi
+}
+
+fly_dockerfile="$(fly_dockerfile_from_config)"
+readonly fly_dockerfile
+validate_fly_build
+
+if [[ "${1:-}" == "--validate-fly-build" ]]; then
+  echo "Fly adapter Dockerfile: ${fly_dockerfile}"
+  exit 0
+fi
+
 readonly release_port="${PASEO_RELAY_CI_RELEASE_PORT:-4400}"
 readonly container_port="${PASEO_RELAY_CI_CONTAINER_PORT:-4401}"
 readonly fly_port="${PASEO_RELAY_CI_FLY_PORT:-4402}"
@@ -52,11 +89,11 @@ assert_operations_contract() {
 mix deps.get
 mix hex.audit
 mix format --check-formatted
-MIX_ENV=test mix compile --warnings-as-errors
+env MIX_ENV=test mix compile --warnings-as-errors
 mix deps.unlock --check-unused
 mix test
-MIX_ENV=prod mix compile --warnings-as-errors
-MIX_ENV=prod mix release --overwrite
+env MIX_ENV=prod mix compile --warnings-as-errors
+env MIX_ENV=prod mix release --overwrite
 
 PASEO_RELAY_HOST=127.0.0.1 \
 PASEO_RELAY_PORT="${release_port}" \
@@ -70,8 +107,14 @@ wait "${release_pid}" || true
 release_pid=""
 
 docker build --tag "${generic_image}" .
-docker build --file deployment/fly/Dockerfile --tag "${fly_image}" .
+docker build --file "${fly_dockerfile}" --tag "${fly_image}" .
 docker build --file deployment/load/Dockerfile --tag "${load_image}" .
+
+if [[ "$(docker image inspect --format '{{json .Config.Entrypoint}}' "${fly_image}")" != \
+  '["/adapter-entrypoint"]' ]]; then
+  echo "Fly image does not use /adapter-entrypoint" >&2
+  exit 1
+fi
 
 docker run --detach --name "${generic_container}" \
   --publish "127.0.0.1:${container_port}:4000" \
@@ -116,3 +159,22 @@ if ! wait_for_endpoint "http://127.0.0.1:${fly_port}/health"; then
   exit 1
 fi
 assert_operations_contract "http://127.0.0.1:${fly_port}"
+
+docker exec "${fly_container}" sh -lc \
+  'RELEASE_NODE="paseo_relay@$FLY_PRIVATE_IP" RELEASE_DISTRIBUTION=name ERL_AFLAGS="-proto_dist inet6_tcp" /app/bin/paseo_relay rpc '\''PaseoRelay.FlyDiagnostics.print_snapshot("WyJjaS11bm93bmVkIl0")'\''' \
+  | node --input-type=module -e '
+      let input = "";
+      for await (const chunk of process.stdin) input += chunk;
+      const snapshot = JSON.parse(input.trim());
+      if (snapshot.schema !== 1 || snapshot.machine_id !== "ci-machine" ||
+          snapshot.private_ip !== "::1" || snapshot.release_node !== "paseo_relay@::1" ||
+          snapshot.owners["ci-unowned"] !== "unowned" ||
+          !/^\d+$/.test(snapshot.release_os_pid) ||
+          snapshot.connection_ceiling !== 20000 ||
+          snapshot.capacity_mutation_timeout_ms !== 5000 ||
+          !/^<\d+\.\d+\.\d+>$/.test(snapshot.capacity_pid)) process.exit(1);
+    '
+
+replay_output="$(docker exec "${fly_container}" sh -lc \
+  'RELEASE_NODE="paseo_relay@$FLY_PRIVATE_IP" RELEASE_DISTRIBUTION=name ERL_AFLAGS="-proto_dist inet6_tcp" /app/bin/paseo_relay rpc '\''Code.require_file("/app/diagnostics/replay-e2e.exs"); PaseoRelay.FlyReplayE2E.run(["--endpoint", "ws://127.0.0.1:4000", "--owner", "ci-machine", "--landing", "ci-machine"])'\''')"
+grep --quiet '"status":"ok"' <<<"${replay_output}"

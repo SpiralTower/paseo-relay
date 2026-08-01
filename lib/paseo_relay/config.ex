@@ -8,6 +8,7 @@ defmodule PaseoRelay.Config do
             acceptors: 100,
             connections_per_acceptor: 200,
             http_idle_timeout_ms: 15_000,
+            capacity_mutation_timeout_ms: 5_000,
             ingress_budget_bytes: 512 * 1024 * 1024,
             ingress_weight: 4,
             delivery_timeout_ms: 30_000,
@@ -49,6 +50,13 @@ defmodule PaseoRelay.Config do
              environment,
              "PASEO_RELAY_HTTP_IDLE_TIMEOUT_MS",
              defaults.http_idle_timeout_ms,
+             100..120_000
+           ),
+         {:ok, capacity_mutation_timeout_ms} <-
+           integer(
+             environment,
+             "PASEO_RELAY_CAPACITY_MUTATION_TIMEOUT_MS",
+             defaults.capacity_mutation_timeout_ms,
              100..120_000
            ),
          {:ok, ingress_budget_bytes} <-
@@ -127,6 +135,7 @@ defmodule PaseoRelay.Config do
          acceptors: acceptors,
          connections_per_acceptor: connections_per_acceptor,
          http_idle_timeout_ms: http_idle_timeout_ms,
+         capacity_mutation_timeout_ms: capacity_mutation_timeout_ms,
          ingress_budget_bytes: ingress_budget_bytes,
          ingress_weight: ingress_weight,
          delivery_timeout_ms: delivery_timeout_ms,

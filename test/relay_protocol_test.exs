@@ -168,7 +168,13 @@ defmodule PaseoRelay.RelayProtocolTest do
     owner_down = Process.monitor(owner)
     Process.exit(owner, :session_conflict)
     assert_receive {:DOWN, ^owner_down, :process, ^owner, :session_conflict}
-    assert {:ok, admission} = PaseoRelay.ConnectionBudget.admit(budget_namespace, 1)
+
+    assert {:ok, admission} =
+             PaseoRelay.Capacity.admit_connection(
+               budget_namespace,
+               1,
+               PaseoRelay.Config.defaults().capacity_mutation_timeout_ms
+             )
 
     state = %{
       admission: admission,
@@ -181,8 +187,8 @@ defmodule PaseoRelay.RelayProtocolTest do
     assert {[{:close, 1012, "Session expired"}], failed_state} =
              PaseoRelay.Socket.websocket_init(state)
 
-    PaseoRelay.ConnectionBudget.release(failed_state.admission.token)
-    assert PaseoRelay.ConnectionBudget.active(budget_namespace) == 0
+    PaseoRelay.Capacity.release_connection(failed_state.admission.token)
+    assert PaseoRelay.Capacity.active_connections(budget_namespace) == 0
   end
 
   @tag timeout: 75_000

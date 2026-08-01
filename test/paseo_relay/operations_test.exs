@@ -74,8 +74,8 @@ defmodule PaseoRelay.OperationsTest do
     assert PaseoRelay.Metrics.value(:reroute_responses) == reroutes_before_failure
   end
 
-  @tag timeout: 10_000
-  test "metrics uses one bounded Capacity lookup when the ledger is stalled" do
+  @tag timeout: 5_000
+  test "readiness is bounded and unavailable while Capacity is stalled" do
     capacity = Process.whereis(PaseoRelay.Capacity)
     :ok = :sys.suspend(capacity)
 
@@ -83,12 +83,94 @@ defmodule PaseoRelay.OperationsTest do
       if Process.alive?(capacity), do: :sys.resume(capacity)
     end)
 
-    response = Task.async(fn -> Operations.response("/metrics") end)
-    assert {:ok, {200, _content_type, metrics}} = Task.yield(response, 7_000)
-    assert metrics =~ "paseo_relay_active_websockets 0"
-    assert metrics =~ "paseo_relay_ingress_reserved_bytes 0"
-    assert metrics =~ "paseo_relay_inflight_delivery_bytes 0"
-    assert metrics =~ "paseo_relay_backpressured_sources 0"
+    started = System.monotonic_time(:millisecond)
+    response = http_get("/ready", 1_500)
+    elapsed = System.monotonic_time(:millisecond) - started
+
+    assert response =~ "HTTP/1.1 503 Service Unavailable"
+    assert response =~ ~s({"status":"unready"})
+    assert elapsed < 1_500
+
+    :ok = :sys.resume(capacity)
+    recovered = http_get("/ready")
+    assert recovered =~ "HTTP/1.1 200 OK"
+    assert recovered =~ ~s({"status":"ready"})
+  end
+
+  @tag timeout: 5_000
+  test "metrics omits unavailable Capacity gauges and retains independent telemetry" do
+    websocket = open_websocket("stalled-metrics-established")
+
+    on_exit(fn ->
+      :gen_tcp.close(websocket)
+      await_no_active_websockets()
+    end)
+
+    PaseoRelay.Metrics.inc(:reroute_responses)
+    reroutes = PaseoRelay.Metrics.value(:reroute_responses)
+    capacity = Process.whereis(PaseoRelay.Capacity)
+    :ok = :sys.suspend(capacity)
+
+    on_exit(fn ->
+      if Process.alive?(capacity), do: :sys.resume(capacity)
+    end)
+
+    started = System.monotonic_time(:millisecond)
+    metrics = http_get("/metrics", 1_500)
+    elapsed = System.monotonic_time(:millisecond) - started
+
+    assert metrics =~ "HTTP/1.1 200 OK"
+    assert metrics =~ "paseo_relay_ready 0"
+    assert elapsed < 1_500
+    refute metrics =~ "paseo_relay_active_websockets"
+    refute metrics =~ "paseo_relay_ingress_reserved_bytes"
+    refute metrics =~ "paseo_relay_inflight_delivery_bytes"
+    refute metrics =~ "paseo_relay_backpressured_sources"
+    assert metrics =~ "paseo_relay_reroute_responses_total #{reroutes}"
+    assert metrics =~ "paseo_relay_active_sessions"
+    assert metrics =~ "paseo_relay_delivery_wait_seconds"
+    assert metrics =~ "paseo_relay_beam_binary_memory_bytes"
+
+    :ok = :sys.resume(capacity)
+    :ok = :gen_tcp.close(websocket)
+  end
+
+  defp open_websocket(server_id) do
+    port = PaseoRelay.Listener.port(PaseoRelay.Listener)
+    {:ok, socket} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false])
+    key = Base.encode64(:crypto.strong_rand_bytes(16))
+
+    request =
+      "GET /ws?serverId=#{server_id}&role=server&v=2 HTTP/1.1\r\n" <>
+        "Host: relay.test\r\n" <>
+        "Upgrade: websocket\r\n" <>
+        "Connection: Upgrade\r\n" <>
+        "Sec-WebSocket-Version: 13\r\n" <>
+        "Sec-WebSocket-Key: #{key}\r\n\r\n"
+
+    :ok = :gen_tcp.send(socket, request)
+    assert {:ok, response} = :gen_tcp.recv(socket, 0, 2_000)
+    assert response =~ "HTTP/1.1 101 Switching Protocols"
+    socket
+  end
+
+  defp http_get(path, timeout \\ 2_000) do
+    port = PaseoRelay.Listener.port(PaseoRelay.Listener)
+    {:ok, socket} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false])
+    :ok = :gen_tcp.send(socket, "GET #{path} HTTP/1.0\r\nHost: relay.test\r\n\r\n")
+    response = recv_all(socket, System.monotonic_time(:millisecond) + timeout, [])
+    :ok = :gen_tcp.close(socket)
+    response
+  end
+
+  defp recv_all(socket, deadline, chunks) do
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    case :gen_tcp.recv(socket, 0, remaining) do
+      {:ok, data} -> recv_all(socket, deadline, [data | chunks])
+      {:error, :closed} -> chunks |> Enum.reverse() |> IO.iodata_to_binary()
+      {:error, :timeout} -> flunk("HTTP response did not finish before the probe deadline")
+    end
   end
 
   defp await_metrics_replacement(previous) do
@@ -108,6 +190,27 @@ defmodule PaseoRelay.OperationsTest do
 
         Process.sleep(10)
         await_metrics_replacement(previous, deadline)
+    end
+  end
+
+  defp await_no_active_websockets do
+    deadline = System.monotonic_time(:millisecond) + 2_000
+    await_no_active_websockets(deadline)
+  end
+
+  defp await_no_active_websockets(deadline) do
+    cond do
+      PaseoRelay.Metrics.value(:active_websockets) == 0 ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("active WebSocket gauge did not return to zero")
+
+      true ->
+        receive do
+        after
+          10 -> await_no_active_websockets(deadline)
+        end
     end
   end
 end

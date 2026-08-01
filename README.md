@@ -49,6 +49,7 @@ generic:
 | `PASEO_RELAY_ACCEPTORS` | `100` | Listener acceptor processes. |
 | `PASEO_RELAY_CONNECTIONS_PER_ACCEPTOR` | `200` | Capacity factor multiplied by the acceptor count to set the node-local active-WebSocket ceiling; the default is 20,000. |
 | `PASEO_RELAY_HTTP_IDLE_TIMEOUT_MS` | `15000` | Maximum idle time for pre-upgrade HTTP parsing and unread request bodies. Upgraded WebSockets remain exempt. |
+| `PASEO_RELAY_CAPACITY_MUTATION_TIMEOUT_MS` | `5000` | Maximum wait for a state-changing Capacity decision before the exact ledger epoch is invalidated. This default is provisional; certify the selected value with the staging epoch gate before rollout. |
 | `PASEO_RELAY_INGRESS_BUDGET_BYTES` | `536870912` | Node-wide weighted ceiling for complete WebSocket messages admitted to relay delivery. Must admit one maximum message at the configured weight. |
 | `PASEO_RELAY_INGRESS_WEIGHT` | `4` | Conservative memory weight charged per wire payload byte. |
 | `PASEO_RELAY_DELIVERY_TIMEOUT_MS` | `30000` | Maximum Writer reservation/write-barrier wait before a slow destination is shed. |
@@ -62,10 +63,21 @@ generic:
 
 `GET /health` is a liveness probe. `GET /ready` returns `200` only while the
 node accepts new work, and returns `503 {"status":"unready"}` while draining
-or below the configured cluster floor. `GET /metrics` is Prometheus text and
-exposes readiness, draining, active WebSockets, active sessions, reroutes,
-connection rejections, delivery pressure and latency, frame sizes, slow-consumer
-closes, ingress reservations, and BEAM memory for the local node.
+or below the configured cluster floor, when the node-local Capacity ledger does
+not answer its one-second status observation, during a memory-pressure episode,
+or while the application WebSocket ceiling is full. Fly's soft limit and
+temporary ingress-byte occupancy do not make the application unready. `GET
+/metrics` is Prometheus text and exposes readiness, draining, active WebSockets,
+active sessions, reroutes, connection rejections, delivery pressure and latency,
+frame sizes, slow-consumer closes, ingress reservations, and BEAM memory for the
+local node. If Capacity is unavailable, its four gauge families are omitted
+rather than reported as zero.
+
+State-changing Capacity decisions use a separate configured fail-closed
+boundary. Each caller captures the current ledger PID; a timeout kills that
+exact Capacity epoch, and `:rest_for_one` drains its listener and sockets before
+a clean replacement admits traffic. Read-only readiness and metrics status uses
+one second and never kills the ledger.
 
 Payloads never pass through a node-wide relay mailbox. Each `serverId` Owner
 stores topology metadata only, and every destination has a Writer allowing one
@@ -93,12 +105,13 @@ frames and reassembled fragmented messages and closes an oversized message with
 `1009`. The only supported inbound v2 control message is the legacy JSON ping;
 control input has a separate 64 KiB Cowboy ceiling and is charged to the same
 ledger through parsing. Outbound control notifications use the same Writer
-boundary with their own bounded byte queue. Because Cowboy exposes incomplete
-fragment assembly only inside its connection process, the configured node
-memory watermark monitors every admitted socket and can shed an assembling
-source before the runtime limit; blocked deliveries are shed first. A nonzero
-watermark is required for a strict deployment-wide memory bound, so generic
-operators must set it from their runtime limit.
+boundary with their own bounded byte queue. Cowboy assembles a complete payload
+before the application can request its byte-only Capacity token, and incomplete
+fragment assembly remains inside the connection process. The 32 MiB ceiling,
+per-WebSocket heap fuse, and configured node memory watermark limit and shed
+this staging risk; they do not provide a strict pre-parser memory reservation.
+Generic operators should set a nonzero watermark from their runtime limit;
+blocked deliveries are shed first.
 
 See [`OPERATIONS.md`](OPERATIONS.md) for the production failure model,
 capacity policy, and alerting signals.
@@ -139,20 +152,19 @@ CI deliberately keeps this boundary bounded: 25 paired sockets under sustained
 traffic, 25 pairs across two reconnect waves, and 200 distinct ownership
 claims. That catches protocol, concurrency, cleanup, and reconnect regressions;
 it is not evidence for the current roughly 23,000-WebSocket production fleet.
-Before rollout, repeat the production-shaped ownership wave in staging:
 
-```sh
-ulimit -n 100000
-node scripts/relay-load.mjs --scenario ownership --servers 23000 --batch-size 250 --ramp-ms 100 --duration 30 --relay-pid "$RELAY_PID"
-```
-
-The staging gate passes only with `connection_failures`, `send_failures`,
-`ordering_failures`, `cleanup_timeouts`, and `frames_lost` all at zero; relay
-RSS must remain below the deployment memory limit with headroom for the ingress
-budget, and active-WebSocket/ingress/in-flight gauges must return to zero after
-cleanup. This command validates fleet-sized connection and ownership churn;
-the sustained and reconnect commands below remain separate per-session data
-path gates.
+The generic load client deliberately has no provider fault or certification
+mode. Fly's short manual procedure starts three ordinary sustained-load
+processes through exact-Machine proxies and owns only Fly-specific fault and
+cleanup commands. See [deployment/fly/README.md](deployment/fly/README.md) for
+the fixed 23,001-WebSocket command, operator inputs, and numeric pass criteria.
+The documented contract uses `PASEO_FLY_EXPECTED_CONNECTION_CEILING`, requires
+all old target sockets to drain, and then runs a full same-`serverId`
+replacement shard inside the configured timeout tolerance. That destructive
+staging-only gate requires a persistent `PASEO_FLY_ARTIFACT_DIR` and has not
+been run for this change. Its short `summary.json` indexes retained raw traffic,
+diagnostic, ownership, timing, cleanup, and memory-peak evidence rather than
+copying those producer schemas.
 
 Distributed ownership and reroute decisions are exercised with real local BEAM
 peer nodes in the test suite:
@@ -169,7 +181,7 @@ clients still use one public endpoint and the proxy performs node placement.
 Capacity tests need an appropriate file-descriptor limit and kernel socket
 budget. The ownership scenario opens one real daemon-control WebSocket for each
 distinct `serverId`; it measures ownership churn rather than many clients on one
-daemon. Example high-load commands, deliberately not defaults:
+daemon. Other high-load diagnostic commands, deliberately not rollout gates:
 
 ```sh
 ulimit -n 120000

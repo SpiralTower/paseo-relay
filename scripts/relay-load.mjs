@@ -6,6 +6,7 @@
  */
 import process from "node:process";
 import { spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 
 const usage = `Usage: node scripts/relay-load.mjs [options]
 
@@ -23,7 +24,7 @@ const usage = `Usage: node scripts/relay-load.mjs [options]
   --rate <messages/s>       Bidirectional sustained rate (default: 10)
   --burst <n>               Bidirectional messages sent once after connection
   --reconnects <n>          Reconnection waves for reconnect scenario (default: 3)
-  --payload-bytes <n>       Frame size target (default: 128)
+  --payload-bytes <n>       Padding bytes after frame metadata (default: 128)
   --keepalive <seconds>     Send a small frame on every socket at this interval
   --cleanup-grace <seconds> Wait for clean close handshakes (default: 15)
   --drain-timeout <seconds> Wait for all sent frames before teardown (default: 15)
@@ -143,7 +144,12 @@ function open(url, stats, keepaliveMs) {
       state.closed = true;
       clearInterval(state.keepalive);
       finish();
-      if (event.code !== 1000 && !(state.finalizing && [1001, 1005, 1012].includes(event.code))) fail();
+      if (event.code === 1000 || (state.finalizing && [1001, 1005, 1012].includes(event.code))) {
+        stats.normal_closes += 1;
+      } else {
+        stats.abnormal_closes += 1;
+        fail();
+      }
     });
   });
   opening.socket = socket;
@@ -282,7 +288,7 @@ async function main() {
   let options;
   try { options = args(process.argv.slice(2)); } catch (error) { console.error(error.message); process.exitCode = 2; return; }
   if (options.help) { process.stdout.write(usage); return; }
-  const stats = { connection_successes: 0, connection_failures: 0, cleanup_timeouts: 0, send_failures: 0, keepalive_frames_sent: 0, keepalive_frames_received: 0, frames_sent: 0, frames_received: 0, bytes_sent: 0, bytes_received: 0, ordering_failures: 0 };
+  const stats = { connection_successes: 0, connection_failures: 0, normal_closes: 0, abnormal_closes: 0, cleanup_timeouts: 0, send_failures: 0, keepalive_frames_sent: 0, keepalive_frames_received: 0, frames_sent: 0, frames_received: 0, bytes_sent: 0, bytes_received: 0, ordering_failures: 0 };
   const latencies = [];
   const started = now();
   let setupDurationMs = 0;
@@ -298,6 +304,14 @@ async function main() {
       servers = await connectServers(options, stats);
     } else if (options.control) {
       control = await open(endpoint(options.endpoints[0], { serverId: options.serverId, role: "server", v: "2" }), stats, options.keepaliveMs);
+      control.addEventListener("message", (event) => {
+        let message;
+        try { message = JSON.parse(String(event.data)); } catch { return; }
+        if (message.type !== "pong") return;
+        stats.frames_received += 1;
+        stats.bytes_received += Buffer.byteLength(String(event.data));
+        stats.on_receive?.();
+      });
     }
     if (options.scenario !== "ownership") {
       const waves = options.scenario === "reconnect" ? options.reconnects + 1 : 1;
@@ -316,6 +330,7 @@ async function main() {
     const publish = () => {
       sequence += 1;
       pairs.forEach(({ server, client }) => { send(client, payload("client", sequence), stats); send(server, payload("server", sequence), stats); });
+      if (control) send(control, '{"type":"ping"}', stats);
     };
     if (options.scenario === "burst" || options.burst) for (let i = 0; i < Math.max(1, options.burst); i += 1) publish();
     if (options.scenario === "sustained") {
@@ -360,4 +375,6 @@ async function main() {
   process.stdout.write(output, () => process.exit(status));
 }
 
-main();
+export { endpoint, finish, open, send, sleep };
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();

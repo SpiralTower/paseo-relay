@@ -3,6 +3,7 @@ defmodule PaseoRelay.Socket do
 
   @behaviour :cowboy_websocket
 
+  alias PaseoRelay.Capacity
   alias PaseoRelay.Delivery
   alias PaseoRelay.Delivery.Deadline
   alias PaseoRelay.Delivery.Writer
@@ -12,7 +13,10 @@ defmodule PaseoRelay.Socket do
   def init(request, options) do
     with true <- :cowboy_websocket.is_upgrade_request(request),
          {:ok, connection} <- connection(request),
-         {:local, owner, reservation, admission} <- route(connection, options) do
+         # Cowboy runs this callback in a request process; request.pid owns the
+         # connection before and after the WebSocket upgrade.
+         {:local, owner, reservation, admission} <-
+           route(connection, options, Map.fetch!(request, :pid)) do
       state = %{
         admission: admission,
         config: options.config,
@@ -63,7 +67,11 @@ defmodule PaseoRelay.Socket do
       kill: true
     })
 
-    with {:ok, capacity} <- PaseoRelay.ConnectionBudget.attach(state.admission),
+    with {:ok, capacity} <-
+           Capacity.attach_connection(
+             state.admission,
+             state.config.capacity_mutation_timeout_ms
+           ),
          {:ok, writer} <-
            Writer.start(
              self(),
@@ -93,7 +101,10 @@ defmodule PaseoRelay.Socket do
   def websocket_handle({opcode, payload}, state) when opcode in [:text, :binary] do
     PaseoRelay.Metrics.observe_frame(byte_size(payload))
 
-    case PaseoRelay.Capacity.admit_message(byte_size(payload)) do
+    case PaseoRelay.Capacity.admit_message(
+           byte_size(payload),
+           state.config.capacity_mutation_timeout_ms
+         ) do
       {:ok, token} -> admit_input(opcode, payload, token, state)
       {:error, _reason} -> {[{:close, 1013, "Relay ingress capacity"}], state}
     end
@@ -160,7 +171,7 @@ defmodule PaseoRelay.Socket do
       PaseoRelay.Capacity.cancel_message(delivery.token)
     end
 
-    PaseoRelay.ConnectionBudget.release(admission_token(state.admission))
+    Capacity.release_connection(admission_token(state.admission))
     Owner.detach(owner, self())
   end
 
@@ -179,7 +190,7 @@ defmodule PaseoRelay.Socket do
   end
 
   defp start_delivery(opcode, payload, token, state) do
-    case PaseoRelay.Capacity.start_delivery(token) do
+    case PaseoRelay.Capacity.start_delivery(token, state.config.capacity_mutation_timeout_ms) do
       :ok ->
         source = self()
         deadline = Deadline.after_ms(state.config.delivery_timeout_ms)
@@ -227,7 +238,10 @@ defmodule PaseoRelay.Socket do
   defp handle_control_input({:text, payload}, state) do
     PaseoRelay.Metrics.observe_frame(byte_size(payload))
 
-    case PaseoRelay.Capacity.admit_message(byte_size(payload)) do
+    case PaseoRelay.Capacity.admit_message(
+           byte_size(payload),
+           state.config.capacity_mutation_timeout_ms
+         ) do
       {:ok, token} ->
         result = handle_admitted_control(payload, state)
         :ok = PaseoRelay.Capacity.finish_message(token)
@@ -271,20 +285,22 @@ defmodule PaseoRelay.Socket do
     PaseoRelay.Connection.from_query(query)
   end
 
-  defp admit({namespace, limit}), do: PaseoRelay.ConnectionBudget.admit(namespace, limit)
+  defp admit({namespace, limit}, holder, timeout),
+    do: Capacity.admit_connection(namespace, limit, holder, timeout)
 
-  defp route(connection, options) do
+  defp route(connection, options, holder) do
     case PaseoRelay.Ownership.resolve(connection.server_id) do
       {:reroute, _target} = decision ->
         decision
 
       decision when decision in [:local, :unowned] ->
-        admit_and_route(connection, options)
+        admit_and_route(connection, options, holder)
     end
   end
 
-  defp admit_and_route(connection, options) do
-    with {:ok, admission} <- admit(options.connection_budget) do
+  defp admit_and_route(connection, options, holder) do
+    with {:ok, admission} <-
+           admit(options.connection_budget, holder, options.config.capacity_mutation_timeout_ms) do
       decision =
         PaseoRelay.Ownership.route(
           connection.server_id,
@@ -297,7 +313,7 @@ defmodule PaseoRelay.Socket do
           {:local, owner, reservation, admission}
 
         _not_local ->
-          PaseoRelay.ConnectionBudget.release(admission)
+          Capacity.release_connection(admission)
           decision
       end
     end

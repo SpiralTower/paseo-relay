@@ -56,6 +56,22 @@ defmodule PaseoRelay.LoadClientTest do
     assert output =~ "--cleanup-grace"
   end
 
+  test "the generic load client has no provider staging coordinator" do
+    {help, 0} = System.cmd("node", ["scripts/relay-load.mjs", "--help"])
+
+    refute help =~ "staging-epoch"
+    refute help =~ "staging-manifest"
+
+    {_output, status} =
+      System.cmd(
+        "node",
+        ["scripts/relay-load.mjs", "--scenario", "staging-epoch"],
+        stderr_to_stdout: true
+      )
+
+    assert status == 2
+  end
+
   test "a failed setup closes a sibling socket that opens later" do
     relay_port = available_port()
     unavailable_port = available_port()
@@ -144,6 +160,8 @@ defmodule PaseoRelay.LoadClientTest do
            }
 
     assert result["frames_received"] > 0
+    assert result["steady_duration_ms"] >= 1_000
+    assert result["frames_sent"] >= 18 * result["requested_websockets"]
     stop_relay(relay_pid)
   end
 
@@ -180,6 +198,95 @@ defmodule PaseoRelay.LoadClientTest do
     assert is_integer(result["keepalive_frames_sent"])
     assert result["keepalive_frames_sent"] > 0
     assert result["connection_failures"] == 0
+  end
+
+  @tag :relay
+  test "sustained traffic exercises its control socket with valid protocol frames", %{port: port} do
+    {output, status} =
+      System.cmd("node", [
+        "scripts/relay-load.mjs",
+        "--endpoints",
+        "ws://127.0.0.1:#{port}/ws",
+        "--server-id",
+        "control-traffic",
+        "--pairs",
+        "0",
+        "--scenario",
+        "sustained",
+        "--duration",
+        "0.2",
+        "--rate",
+        "10"
+      ])
+
+    result = Jason.decode!(output)
+
+    assert status == 0
+    assert result["requested_websockets"] == 1
+    assert result["frames_sent"] > 0
+    assert result["frames_received"] == result["frames_sent"]
+    assert result["frames_lost"] == 0
+    assert result["normal_closes"] == 1
+    assert result["abnormal_closes"] == 0
+  end
+
+  @tag :relay
+  test "a replacement run reuses the same server id with clean data and control traffic", %{
+    port: port
+  } do
+    results =
+      for prefix <- ["old-epoch", "replacement-epoch"] do
+        {output, status} =
+          System.cmd("node", [
+            "scripts/relay-load.mjs",
+            "--endpoints",
+            "ws://127.0.0.1:#{port}/ws",
+            "--server-id",
+            "replacement-session",
+            "--connection-prefix",
+            prefix,
+            "--pairs",
+            "2",
+            "--scenario",
+            "sustained",
+            "--duration",
+            "0.2",
+            "--rate",
+            "10"
+          ])
+
+        {status, Jason.decode!(output)}
+      end
+
+    assert Enum.map(results, fn {status, result} ->
+             Map.take(Map.put(result, "status", status), [
+               "status",
+               "requested_websockets",
+               "connection_successes",
+               "connection_failures",
+               "normal_closes",
+               "abnormal_closes",
+               "send_failures",
+               "ordering_failures",
+               "frames_lost"
+             ])
+           end) ==
+             List.duplicate(
+               %{
+                 "status" => 0,
+                 "requested_websockets" => 5,
+                 "connection_successes" => 5,
+                 "connection_failures" => 0,
+                 "normal_closes" => 5,
+                 "abnormal_closes" => 0,
+                 "send_failures" => 0,
+                 "ordering_failures" => 0,
+                 "frames_lost" => 0
+               },
+               2
+             )
+
+    assert Enum.all?(results, fn {_status, result} -> result["frames_sent"] > 0 end)
   end
 
   @tag :relay

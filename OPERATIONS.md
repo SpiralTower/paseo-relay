@@ -162,16 +162,108 @@ with room for the configured ingress budget and VM overhead.
   a finite idle lifetime; upgraded WebSockets explicitly retain an infinite
   protocol idle timeout and rely on their application lifecycle instead.
 
+  Public state-changing decisions capture the exact current Capacity PID and
+  wait up to the configured Capacity mutation timeout for that epoch's reply.
+  A reply is the decision. If the captured PID dies first, the caller returns
+  the existing unavailable result. If the call times out, the caller kills that
+  exact PID and returns
+  unavailable; it never kills a process subsequently registered under the same
+  name. The runtime supervisor's `:rest_for_one` ordering then stops the
+  listener and every socket from the failed epoch before replacement Capacity
+  can admit traffic. This deliberately turns an authority stall at that bound
+  into a node-local reconnect wave so that no externally failed mutation
+  survives in a later accounting epoch. The generic default and Fly template
+  currently select 5,000 ms, provisionally; the combined staging epoch gate must
+  certify that value for the intended topology and Machine size before rollout.
+
+  The Fly-only manual gate distributes exactly 23,001 real WebSockets across
+  three exact Machines: 7,667 per Machine, below both deployed application
+  ceilings and Fly placement limits. It is a short POSIX procedure around three
+  ordinary `relay-load.mjs` sustained runs. Every pair sends a frame containing
+  1,024 padding bytes plus timestamp, direction, and sequence metadata in both
+  directions once per second, while each control socket sends a valid ping,
+  including throughout the target Machine's Capacity stall. The procedure reads
+  the deployed ceiling and mutation timeout
+  from each release, resets each Machine's cgroup-v2 `memory.peak`, and records
+  the exact target Capacity PID. The fault reports the VM monotonic timestamp
+  immediately after `:sys.suspend/1` acknowledges. Public message traffic then
+  causes the configured timeout to invalidate that exact epoch. The first
+  replacement observation must fall between that timeout and the timeout plus
+  the validated replacement-observation tolerance, provisionally 1,000 ms; the
+  final result records both monotonic timestamps and their difference.
+
+  EXIT, SIGINT, and SIGTERM cleanup always asks the target release to kill the
+  captured PID only if it is still the registered Capacity, then stops load
+  processes, waits the Owner grace interval, and requires every exact-Machine
+  proxy to be ready with zero Capacity gauges. Every release must report all
+  three staged server IDs unowned, and each final `memory.peak` must remain under
+  the operator-supplied ceiling. Unaffected shard JSON permits zero connection
+  failure, send failure, ordering failure, cleanup timeout, or frame loss. All
+  7,667 old target sockets must report an abnormal epoch disconnect. A second
+  full 7,667-socket sustained run then reuses the same target `serverId` through
+  the replacement listener and requires zero connection, send, ordering,
+  cleanup, or frame-loss failures. The exact credentials, three-Machine
+  topology, timeout, replacement tolerance, application connection ceiling,
+  memory ceiling, and free local ports are operator inputs. The gate has not
+  been run.
+
+  The gate requires a persistent operator artifact directory before destructive
+  work. It retains each unchanged load-producer JSON, bounded redacted stderr,
+  child exits, initial/final diagnostics, per-observer ownership, timing,
+  readiness, raw final metrics, and identified `memory.peak` reset/read evidence.
+  One short `summary.json` is emitted on success or failure and contains file
+  references, key numeric checks, and stable
+  `{check,node,shard,expected,actual,reason}` failures. Evidence is never reduced
+  into a second certification schema or deleted by cleanup.
+
+  Every sustained result must cover its requested duration. Unaffected and
+  replacement traffic must send at least
+  `(duration_seconds * rate - 2) * 7,667` frames; the affected minimum uses the
+  configured timeout window because that epoch intentionally drains. This
+  conservative two-tick allowance prevents a one-tick result from passing a
+  90-second or 10-second run while tolerating interval startup variance.
+
+  Initial connection admission monitors Cowboy's persistent connection
+  process. Attachment is accepted only from that same process and reuses its
+  monitor; the five-second attachment lease still removes a live holder that
+  never upgrades. Message tokens belong to an already-monitored socket.
+  Release, finish, and cancel are idempotent one-way cleanup optimizations;
+  holder `DOWN` is sufficient for correctness. Synchronous pressure checks and
+  watermark changes use the same exact-PID timeout invalidation, so an
+  unavailable result cannot be followed by a late mutation in a surviving
+  epoch.
+
+  One tagged Capacity status observation supplies authority availability, the
+  configured listener namespace's admission state, and all four transient
+  gauges through a read-only one-second call. It fits inside the production
+  readiness probe's two-second deadline and never kills Capacity.
+  `/ready` returns `503` when Capacity is unavailable, memory pressure is active,
+  or the application WebSocket ceiling is full. The Fly soft limit and temporary
+  occupancy of the ingress byte budget are not readiness conditions. `/metrics`
+  performs the same single observation per render; when Capacity is unavailable
+  it reports ready zero, retains independent counters, sessions, histograms, and
+  BEAM metrics, and omits the four unknown Capacity gauges. Actual Capacity
+  process death remains the only epoch trigger: `:rest_for_one` stops
+  the listener and old connections before a replacement ledger reopens
+  admission.
+
   The masked client data-frame wire ceiling remains exactly 32 MiB, so Cowboy
   bounds each complete or reassembled fragmented message to `32 MiB - 14 bytes`
   and sends `1009` for one byte more. Inbound v2 control input is limited to
   64 KiB, charged through JSON parsing, and oversized input receives `1009`.
-  Incomplete fragments have not crossed the application boundary, so Cowboy's
-  message ceiling, the per-WebSocket heap fuse, and the node memory watermark
-  protect them instead. A pressure episode pauses new connection and message
-  admission, sheds the oldest blocked delivery first and then the newest active
-  sockets as a conservative proxy for recent fragment retention, and sizes
-  subsequent bounded batches from measured BEAM memory relief. Admission
+  Cowboy has already assembled a complete payload before `websocket_handle/2`
+  can request its byte-only Capacity token. The 32 MiB ceiling, per-WebSocket
+  heap fuse, and node memory watermark limit and shed that staging risk, but do
+  not create a strict pre-parser memory reservation. During a Capacity stall,
+  one completed payload per active socket can remain staged for the configured
+  mutation timeout before the epoch is drained. That reconnect and memory
+  exposure must be exercised at the documented 23,001-socket staging gate
+  before rollout; it has not been certified by the local suite. Incomplete
+  fragments also remain inside Cowboy until completion. A pressure episode
+  pauses new connection and message admission, sheds the oldest blocked
+  delivery first and then the newest active sockets as a conservative proxy for
+  recent fragment retention, and sizes subsequent bounded batches from measured
+  BEAM memory relief. Admission
   resumes only below a one-maximum-message hysteresis threshold. The generic
   watermark is disabled because the safe threshold depends on the runtime
   limit; a strict generic deployment must set a nonzero threshold. The 2 GB Fly
@@ -229,11 +321,10 @@ configuration is enabled. Custom series are local to a Machine and receive Fly
 labels such as app, region, host, and instance. Do not add `serverId` or
 `connectionId` as labels; their cardinality is unbounded.
 
-The endpoint fetches all transient capacity gauges in one bounded ledger call.
-If that authority is stalled, the scrape returns documented zero fallbacks
-after one timeout rather than serially blocking once per gauge. Readiness is a
-separate authority-health signal; do not interpret fallback zeros as spare
-capacity.
+The endpoint fetches Capacity availability, admission state, and all transient
+capacity gauges in one bounded ledger call. If that authority is stalled, the
+scrape returns a zero ready gauge and omits the four unknown Capacity gauge
+families rather than fabricating zeros or serially blocking once per gauge.
 
 Start with dashboards and alerts for:
 

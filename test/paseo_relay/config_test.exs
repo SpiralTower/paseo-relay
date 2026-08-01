@@ -7,6 +7,17 @@ defmodule PaseoRelay.ConfigTest do
     assert Config.load([]) == {:ok, Config.defaults()}
   end
 
+  test "loads and validates the Capacity mutation timeout" do
+    assert Config.defaults().capacity_mutation_timeout_ms == 5_000
+
+    assert {:ok, %{capacity_mutation_timeout_ms: 7_500}} =
+             Config.load([{"PASEO_RELAY_CAPACITY_MUTATION_TIMEOUT_MS", "7500"}])
+
+    assert Config.load([{"PASEO_RELAY_CAPACITY_MUTATION_TIMEOUT_MS", "99"}]) ==
+             {:error,
+              "PASEO_RELAY_CAPACITY_MUTATION_TIMEOUT_MS must be an integer between 100 and 120000"}
+  end
+
   test "rejects a listener hostname that the socket layer cannot bind" do
     assert Config.load([{"PASEO_RELAY_HOST", "not-an-ip"}]) ==
              {:error, "PASEO_RELAY_HOST must be an IP address"}
