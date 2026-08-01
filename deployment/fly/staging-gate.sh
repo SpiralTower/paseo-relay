@@ -33,6 +33,7 @@ Optional:
 Non-destructive contract checks:
   sh deployment/fly/staging-gate.sh --validate-config
   sh deployment/fly/staging-gate.sh --check-replacement-window ELAPSED_MS
+  sh deployment/fly/staging-gate.sh --check-snapshot MACHINE PRIVATE_IP < snapshot.json
 
 This destructive command is staging-only. It opens exactly 23,001 WebSockets
 (7,667 per Machine) and has not been run or certified for this change.
@@ -383,9 +384,26 @@ validate_replacement_window() {
   }
 }
 
+validate_snapshot() {
+  printf '%s' "$1" | jq -e --arg machine "$2" --arg ip "$3" --argjson timeout "$EXPECTED_TIMEOUT" \
+    --argjson ceiling "$EXPECTED_CONNECTION_CEILING" '.schema==1 and .machine_id==$machine and
+      .private_ip==$ip and .release_node==("paseo_relay@"+$ip) and
+      .capacity_mutation_timeout_ms==$timeout and .connection_ceiling==$ceiling and
+      (.capacity_pid|test("^#PID<[0-9]+\\.[0-9]+\\.[0-9]+>$"))' >/dev/null
+}
+
 case "${1:-}" in
   --validate-config) [ "$#" -eq 1 ] || exit 2; exit 0;;
   --check-replacement-window) [ "$#" -eq 2 ] || exit 2; validate_replacement_window "$2"; exit $?;;
+  --check-snapshot)
+    [ "$#" -eq 3 ] || exit 2
+    checked_snapshot=$(cat)
+    validate_snapshot "$checked_snapshot" "$2" "$3" || {
+      record_failure machine.deployed_config "$2" "" '"matching identity, timeout, ceiling, and Capacity PID"' null \
+        "deployed diagnostic snapshot did not match operator inputs"
+      exit 1
+    }
+    exit 0;;
   '') ;;
   *) usage >&2; record_failure config.arguments "" "" '"documented arguments"' '"invalid"' "unknown argument"; exit 2;;
 esac
@@ -412,13 +430,6 @@ inventory=$(bounded 20 fly machines list --app "$APP" --json) || {
 machine_ip() { printf '%s' "$inventory" | jq -er --arg id "$1" '.[]|select(.id==$id and .state=="started")|.private_ip'; }
 IP1=$(machine_ip "$M1"); IP2=$(machine_ip "$M2"); IP3=$(machine_ip "$M3")
 
-validate_snapshot() {
-  printf '%s' "$1" | jq -e --arg machine "$2" --arg ip "$3" --argjson timeout "$EXPECTED_TIMEOUT" \
-    --argjson ceiling "$EXPECTED_CONNECTION_CEILING" '.schema==1 and .machine_id==$machine and
-      .private_ip==$ip and .release_node==("paseo_relay@"+$ip) and
-      .capacity_mutation_timeout_ms==$timeout and .connection_ceiling==$ceiling and
-      (.capacity_pid|test("^<[0-9]+\\.[0-9]+\\.[0-9]+>$"))' >/dev/null
-}
 for entry in "$M1|$IP1" "$M2|$IP2" "$M3|$IP3"; do
   machine=${entry%%|*}; ip=${entry#*|}; initial=$(snapshot "$machine" "$ip")
   printf '%s\n' "$initial" >"$ARTIFACT_DIR/initial-$machine.json"
@@ -441,15 +452,31 @@ wait_ready "$PORT1"; wait_ready "$PORT2"; wait_ready "$PORT3"
 setup_complete=1
 
 start_load() {
-  node scripts/relay-load.mjs --endpoints "ws://127.0.0.1:$3/ws" --server-id "$2" \
-    --connection-prefix "$1" --pairs "$PAIRS" --batch-size 250 --ramp-ms 100 \
-    --scenario sustained --duration "$4" --rate "$RATE" --payload-bytes "$PAYLOAD_BYTES" \
-    --cleanup-grace 15 --drain-timeout 15 >"$ARTIFACT_DIR/$1.json" 2>"$ephemeral/$1.stderr.raw" &
+  name=$1; sid=$2; port=$3; duration=$4
+  paused=${5:-no}
+  set -- node scripts/relay-load.mjs --endpoints "ws://127.0.0.1:$port/ws" --server-id "$sid" \
+    --connection-prefix "$name" --pairs "$PAIRS" --batch-size 250 --ramp-ms 100 \
+    --scenario sustained --duration "$duration" --rate "$RATE" --payload-bytes "$PAYLOAD_BYTES" \
+    --cleanup-grace 15 --drain-timeout 15
+  [ "$paused" = yes ] && set -- "$@" --start-on-sigusr1
+  "$@" >"$ARTIFACT_DIR/$name.json" 2>"$ephemeral/$name.stderr.raw" &
   last_load=$!; loads="$loads $last_load"
 }
-start_load shard1 "$SID1" "$PORT1" "$DURATION_SECONDS"; load1=$last_load
-start_load shard2 "$SID2" "$PORT2" "$DURATION_SECONDS"; load2=$last_load
-start_load shard3 "$SID3" "$PORT3" "$DURATION_SECONDS"; load3=$last_load
+
+case "$TARGET" in
+  "$M1") target_ip=$IP1; target_port=$PORT1; target_sid=$SID1; pause1=yes; pause2=no; pause3=no;;
+  "$M2") target_ip=$IP2; target_port=$PORT2; target_sid=$SID2; pause1=no; pause2=yes; pause3=no;;
+  *) target_ip=$IP3; target_port=$PORT3; target_sid=$SID3; pause1=no; pause2=no; pause3=yes;;
+esac
+start_load shard1 "$SID1" "$PORT1" "$DURATION_SECONDS" "$pause1"; load1=$last_load
+start_load shard2 "$SID2" "$PORT2" "$DURATION_SECONDS" "$pause2"; load2=$last_load
+start_load shard3 "$SID3" "$PORT3" "$DURATION_SECONDS" "$pause3"; load3=$last_load
+
+case "$TARGET" in
+  "$M1") target_load=$load1;;
+  "$M2") target_load=$load2;;
+  *) target_load=$load3;;
+esac
 
 for port in "$PORT1" "$PORT2" "$PORT3"; do
   attempts=0
@@ -459,19 +486,24 @@ for port in "$PORT1" "$PORT2" "$PORT3"; do
     sleep 0.1
   done
 done
-sleep 3
-
-case "$TARGET" in
-  "$M1") target_ip=$IP1; target_port=$PORT1; target_sid=$SID1;;
-  "$M2") target_ip=$IP2; target_port=$PORT2; target_sid=$SID2;;
-  *) target_ip=$IP3; target_port=$PORT3; target_sid=$SID3;;
-esac
+attempts=0
+while [ "$(metric "$target_port" ingress_reserved_bytes 2>/dev/null || echo missing)" != 0 ] || \
+  [ "$(metric "$target_port" inflight_delivery_bytes 2>/dev/null || echo missing)" != 0 ] || \
+  [ "$(metric "$target_port" backpressured_sources 2>/dev/null || echo missing)" != 0 ]; do
+  attempts=$((attempts + 1)); [ "$attempts" -lt 100 ] || {
+    record_failure shard.target_quiescence "$TARGET" "" '"zero Capacity traffic gauges"' null \
+      "paused target shard did not quiesce before suspension"; exit 1; }
+  sleep 0.1
+done
 target_snapshot=$(snapshot "$TARGET" "$target_ip")
 captured_pid=$(printf '%s' "$target_snapshot" | jq -er .capacity_pid)
 suspended=$(rpc "$TARGET" "$target_ip" "PaseoRelay.FlyDiagnostics.suspend_capacity(\"$captured_pid\")" | json_line)
 printf '%s\n' "$suspended" >"$ARTIFACT_DIR/suspension.json"
 ack_ms=$(printf '%s' "$suspended" | jq -er --arg machine "$TARGET" --arg pid "$captured_pid" \
   'select(.event=="capacity_suspended" and .machine_id==$machine and .capacity_pid==$pid)|.acknowledged_monotonic_ms')
+kill -USR1 "$target_load" || {
+  record_failure shard.target_publisher "$TARGET" "" '"SIGUSR1 accepted after suspension acknowledgement"' null \
+    "paused target publisher could not be started"; exit 1; }
 curl --max-time 2 --fail --silent "http://127.0.0.1:$target_port/health" >/dev/null
 [ "$(curl --max-time 2 --silent -o /dev/null -w '%{http_code}' "http://127.0.0.1:$target_port/ready")" = 503 ]
 
@@ -489,7 +521,8 @@ jq -n --argjson acknowledged "$ack_ms" --argjson observed "$changed_ms" \
   --argjson elapsed "$replacement_elapsed_ms" --argjson timeout "$EXPECTED_TIMEOUT" \
   --argjson tolerance "$REPLACEMENT_TOLERANCE" '{suspension_acknowledged_monotonic_ms:$acknowledged,
     replacement_observed_monotonic_ms:$observed,replacement_elapsed_ms:$elapsed,
-    configured_timeout_ms:$timeout,observation_tolerance_ms:$tolerance}' >"$ARTIFACT_DIR/timing.json"
+    configured_timeout_ms:$timeout,observation_tolerance_ms:$tolerance,
+    target_publisher_signal:"SIGUSR1",target_publisher_started_after_ack:true}' >"$ARTIFACT_DIR/timing.json"
 validate_replacement_window "$replacement_elapsed_ms" || exit 1
 wait_ready "$target_port"
 
@@ -520,6 +553,7 @@ validate_load() {
   if [ "$role" = affected ]; then expected_abnormal=$WEBSOCKETS; expected_normal=0; expected_exit=nonzero; fi
   actual=$(jq -c '{child_exit_status:$child,requested_websockets:.requested_websockets,
     opened_sockets:.connection_successes,steady_duration_ms:.steady_duration_ms,
+    publisher_started_by_signal:.publisher_started_by_signal,publisher_wait_ms:.publisher_wait_ms,
     frames_sent:.frames_sent,frames_received:.frames_received,frames_lost:.frames_lost,
     normal_closes:.normal_closes,abnormal_closes:.abnormal_closes,
     connection_failures:.connection_failures,send_failures:.send_failures,
@@ -528,6 +562,7 @@ validate_load() {
     --argjson duration "$min_duration" --argjson frames "$min_frames" --argjson normal "$expected_normal" \
     --argjson abnormal "$expected_abnormal" '{role:$role,child_exit_status:$exit,
       requested_websockets:$sockets,opened_sockets:$sockets,steady_duration_ms_at_least:$duration,
+      publisher_started_by_signal:($role=="affected"),
       frames_sent_at_least:$frames,normal_closes:$normal,abnormal_closes:$abnormal}')
   record_key_check shard.traffic "$node" "$name" "$expected" "$actual"
   printf '%s' "$actual" | jq -e --arg role "$role" --argjson sockets "$WEBSOCKETS" \
@@ -535,6 +570,7 @@ validate_load() {
     --argjson normal "$expected_normal" --argjson abnormal "$expected_abnormal" '
       .requested_websockets==$sockets and .opened_sockets==$sockets and
       .steady_duration_ms >= $duration and .frames_sent >= $frames and
+      .publisher_started_by_signal==($role=="affected") and
       .normal_closes==$normal and .abnormal_closes==$abnormal and .ordering_failures==0 and
       .cleanup_timeouts==0 and
       (if $role=="affected" then .child_exit_status!=0 and .send_failures>0

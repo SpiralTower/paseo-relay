@@ -20,6 +20,7 @@ const usage = `Usage: node scripts/relay-load.mjs [options]
   --batch-size <n>          Maximum pairs or servers opened concurrently (default: 100)
   --ramp-ms <milliseconds>  Delay between opening batches (default: 0)
   --scenario <name>         idle, sustained, burst, reconnect, or ownership (default: idle)
+  --start-on-sigusr1        Open sustained sockets now; publish after SIGUSR1
   --duration <seconds>      Measurement duration (default: 10)
   --rate <messages/s>       Bidirectional sustained rate (default: 10)
   --burst <n>               Bidirectional messages sent once after connection
@@ -60,8 +61,12 @@ function args(argv) {
   if (!new Set(["idle", "sustained", "burst", "reconnect", "ownership"]).has(scenario)) {
     throw new Error("--scenario must be idle, sustained, burst, reconnect, or ownership");
   }
+  const startOnSigusr1 = argv.includes("--start-on-sigusr1");
+  if (startOnSigusr1 && scenario !== "sustained") {
+    throw new Error("--start-on-sigusr1 requires --scenario sustained");
+  }
   return {
-    endpoints, serverId: value("--server-id", "load-server"), scenario,
+    endpoints, serverId: value("--server-id", "load-server"), scenario, startOnSigusr1,
     servers: integer("--servers", 1000),
     connectionPrefix: value("--connection-prefix", String(process.pid)),
     control: !argv.includes("--no-control"),
@@ -288,10 +293,17 @@ async function main() {
   let options;
   try { options = args(process.argv.slice(2)); } catch (error) { console.error(error.message); process.exitCode = 2; return; }
   if (options.help) { process.stdout.write(usage); return; }
+  let releasePublisher;
+  let publisherStartedBySignal = false;
+  const publisherSignal = new Promise((resolve) => { releasePublisher = resolve; });
+  const resumePublisher = () => { publisherStartedBySignal = true; releasePublisher(); };
+  if (options.startOnSigusr1) process.on("SIGUSR1", resumePublisher);
+  else releasePublisher();
   const stats = { connection_successes: 0, connection_failures: 0, normal_closes: 0, abnormal_closes: 0, cleanup_timeouts: 0, send_failures: 0, keepalive_frames_sent: 0, keepalive_frames_received: 0, frames_sent: 0, frames_received: 0, bytes_sent: 0, bytes_received: 0, ordering_failures: 0 };
   const latencies = [];
   const started = now();
   let setupDurationMs = 0;
+  let publisherWaitMs = 0;
   let steadyDurationMs = 0;
   let pairs = [];
   let servers = [];
@@ -324,6 +336,10 @@ async function main() {
       }
     }
     setupDurationMs = now() - started;
+    const publisherWaitStarted = now();
+    await publisherSignal;
+    publisherWaitMs = now() - publisherWaitStarted;
+    process.off("SIGUSR1", resumePublisher);
     const steadyStarted = now();
     let sequence = 0;
     const payload = (direction, currentSequence) => `${Date.now()}:${direction}:${currentSequence}:${"x".repeat(options.payloadBytes)}`;
@@ -335,6 +351,7 @@ async function main() {
     if (options.scenario === "burst" || options.burst) for (let i = 0; i < Math.max(1, options.burst); i += 1) publish();
     if (options.scenario === "sustained") {
       const period = Math.max(1, Math.floor(1000 / Math.max(1, options.rate)));
+      if (options.startOnSigusr1) publish();
       const timer = setInterval(publish, period);
       await sleep(options.durationMs);
       clearInterval(timer);
@@ -346,6 +363,7 @@ async function main() {
   } catch (error) {
     stats.error = error.message;
   } finally {
+    process.off("SIGUSR1", resumePublisher);
     clearInterval(sampleTimer);
     await finish([...servers, ...pairs.flatMap(Object.values), ...(control ? [control] : [])], stats, options.cleanupGraceMs);
   }
@@ -364,6 +382,7 @@ async function main() {
       ? options.servers
       : options.pairs * 2 + (options.control ? 1 : 0),
     setup_duration_ms: Math.round(setupDurationMs), steady_duration_ms: Math.round(steadyDurationMs), duration_ms: Math.round(durationMs),
+    publisher_started_by_signal: publisherStartedBySignal, publisher_wait_ms: Math.round(publisherWaitMs),
     ...stats, frames_lost: stats.frames_sent - stats.frames_received,
     throughput_frames_per_second: Number((stats.frames_received / (durationMs / 1000)).toFixed(2)),
     steady_throughput_frames_per_second: Number((stats.frames_received / Math.max(0.001, steadyDurationMs / 1000)).toFixed(2)),

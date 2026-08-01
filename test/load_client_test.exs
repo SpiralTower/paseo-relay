@@ -231,6 +231,67 @@ defmodule PaseoRelay.LoadClientTest do
   end
 
   @tag :relay
+  test "a signaled sustained run holds established sockets before publishing", %{port: port} do
+    command =
+      start_load([
+        "--endpoints",
+        "ws://127.0.0.1:#{port}/ws",
+        "--server-id",
+        "signaled-sustained",
+        "--pairs",
+        "1",
+        "--scenario",
+        "sustained",
+        "--duration",
+        "0.3",
+        "--rate",
+        "10",
+        "--start-on-sigusr1"
+      ])
+
+    {:os_pid, pid} = Port.info(command, :os_pid)
+
+    on_exit(fn ->
+      System.cmd("kill", ["-TERM", Integer.to_string(pid)], stderr_to_stdout: true)
+    end)
+
+    assert_eventually(fn ->
+      request(port, "/metrics") |> metric_value("active_websockets") == 3
+    end)
+
+    forwarded = request(port, "/metrics") |> metric_value("frames_forwarded_total")
+    assert_metric_stays(port, "frames_forwarded_total", forwarded, 300)
+    assert {_, 0} = System.cmd("kill", ["-USR1", Integer.to_string(pid)])
+
+    {output, status} = await_command(command, "", System.monotonic_time(:millisecond) + 5_000)
+    result = Jason.decode!(output)
+
+    assert status == 0
+
+    assert Map.take(result, [
+             "requested_websockets",
+             "publisher_started_by_signal",
+             "send_failures",
+             "ordering_failures",
+             "frames_lost",
+             "normal_closes",
+             "abnormal_closes"
+           ]) == %{
+             "requested_websockets" => 3,
+             "publisher_started_by_signal" => true,
+             "send_failures" => 0,
+             "ordering_failures" => 0,
+             "frames_lost" => 0,
+             "normal_closes" => 3,
+             "abnormal_closes" => 0
+           }
+
+    assert result["publisher_wait_ms"] >= 300
+    assert result["frames_sent"] >= 3
+    assert result["frames_received"] == result["frames_sent"]
+  end
+
+  @tag :relay
   test "a replacement run reuses the same server id with clean data and control traffic", %{
     port: port
   } do
@@ -365,14 +426,16 @@ defmodule PaseoRelay.LoadClientTest do
   end
 
   defp run_load(arguments, timeout) do
-    command =
-      Port.open({:spawn_executable, System.find_executable("node")}, [
-        :binary,
-        :exit_status,
-        args: ["scripts/relay-load.mjs" | arguments]
-      ])
-
+    command = start_load(arguments)
     await_command(command, "", System.monotonic_time(:millisecond) + timeout)
+  end
+
+  defp start_load(arguments) do
+    Port.open({:spawn_executable, System.find_executable("node")}, [
+      :binary,
+      :exit_status,
+      args: ["scripts/relay-load.mjs" | arguments]
+    ])
   end
 
   defp await_command(command, output, deadline) do
@@ -485,6 +548,25 @@ defmodule PaseoRelay.LoadClientTest do
 
       Process.sleep(10)
       assert_eventually(check, deadline)
+    end
+  end
+
+  defp assert_metric_stays(port, name, expected, duration_ms) do
+    deadline = System.monotonic_time(:millisecond) + duration_ms
+    actual = request(port, "/metrics") |> metric_value(name)
+    assert actual == expected
+
+    if System.monotonic_time(:millisecond) < deadline do
+      receive do
+      after
+        10 ->
+          assert_metric_stays(
+            port,
+            name,
+            expected,
+            max(0, deadline - System.monotonic_time(:millisecond))
+          )
+      end
     end
   end
 end

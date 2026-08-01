@@ -179,18 +179,22 @@ with room for the configured ingress budget and VM overhead.
   The Fly-only manual gate distributes exactly 23,001 real WebSockets across
   three exact Machines: 7,667 per Machine, below both deployed application
   ceilings and Fly placement limits. It is a short POSIX procedure around three
-  ordinary `relay-load.mjs` sustained runs. Every pair sends a frame containing
+  ordinary `relay-load.mjs` sustained runs. The target shard establishes all
+  sockets but holds its publisher while the unaffected shards run normally.
+  Immediately after `:sys.suspend/1` acknowledges, the procedure signals the
+  target publisher to start. Every pair then sends a frame containing
   1,024 padding bytes plus timestamp, direction, and sequence metadata in both
   directions once per second, while each control socket sends a valid ping,
   including throughout the target Machine's Capacity stall. The procedure reads
   the deployed ceiling and mutation timeout
   from each release, resets each Machine's cgroup-v2 `memory.peak`, and records
   the exact target Capacity PID. The fault reports the VM monotonic timestamp
-  immediately after `:sys.suspend/1` acknowledges. Public message traffic then
-  causes the configured timeout to invalidate that exact epoch. The first
-  replacement observation must fall between that timeout and the timeout plus
-  the validated replacement-observation tolerance, provisionally 1,000 ms; the
-  final result records both monotonic timestamps and their difference.
+  immediately after `:sys.suspend/1` acknowledges. The deliberately started
+  public message traffic then causes the configured timeout to invalidate that
+  exact epoch, making the acknowledgement the lower-bound clock origin. The
+  first replacement observation must fall between that timeout and the timeout
+  plus the validated replacement-observation tolerance, provisionally 1,000 ms;
+  the final result records both monotonic timestamps and their difference.
 
   EXIT, SIGINT, and SIGTERM cleanup always asks the target release to kill the
   captured PID only if it is still the registered Capacity, then stops load

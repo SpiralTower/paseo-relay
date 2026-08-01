@@ -850,3 +850,27 @@
   amid launcher noise, validates the real `#PID<n.n.n>` representation and all
   prior identity/config/ownership fields, and reports exact field mismatches.
   The focused diagnostic boundary passed 2/2.
+- Final staging-gate red: the executable manual snapshot predicate rejected the
+  real diagnostic `#PID<0.986.0>` value (the new contract test reached the
+  script's usage exit because no predicate boundary was yet exposed). A real
+  three-socket sustained run given the proposed pause option forwarded five
+  frames during a 300 ms absence window instead of retaining the initial count
+  of two, proving publication still began before the signal.
+- Final staging-gate green: the manual gate's own snapshot predicate accepts
+  `#PID<n.n.n>` and rejects the obsolete unprefixed form. A sustained load now
+  installs `SIGUSR1` handling before opening sockets, establishes its data and
+  control sockets without publishing, and begins real bidirectional data plus
+  control traffic only after the signal. The gate pauses only the selected
+  target shard, proves its Capacity traffic gauges have quiesced, records the
+  suspension acknowledgement, then signals publishing so the configured
+  timeout lower bound has the same clock origin. The real paused public-load
+  regression passed 10/10; the focused gate/load files passed 14/14 twice at
+  seeds `804904` and `110677`.
+- Final staging-gate verification: the complete suite passed 98/98 at seed
+  `804904` with `max_cases: 8`. Its first seed `110677` run had one unrelated
+  initial-sync receive timeout in the existing control-notification test; that
+  exact test passed 10/10 and the repeated complete seed passed 98/98.
+  Formatting, diff, unused lock, ShellCheck, POSIX/Bash/Node syntax, derived Fly
+  target validation, test and production warnings-as-errors compilation, and
+  the production release passed. The destructive 23,001-socket staging gate
+  was not run.

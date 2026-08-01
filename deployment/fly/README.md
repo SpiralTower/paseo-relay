@@ -106,7 +106,9 @@ explicit operator decisions. The script verifies the deployed values through
 bounded exact-Machine release RPC before creating sockets. It starts three
 ordinary `relay-load.mjs` sustained processes through exact-Machine `fly proxy`
 connections: 3,833 pairs plus one control socket per Machine, or 7,667 each and
-23,001 total. Every pair sends a frame containing 1,024 padding bytes in
+23,001 total. The target process opens all sockets but holds its sustained
+publisher; the two unaffected processes publish normally. Every publishing
+pair sends a frame containing 1,024 padding bytes in
 addition to timestamp, direction, and sequence metadata in both directions once
 per second, and every control socket sends a valid protocol ping on the same
 cadence.
@@ -114,12 +116,16 @@ cadence.
 Before socket setup, the script resets each exact Machine's cgroup-v2
 `memory.peak`. It captures the target Capacity PID, calls `:sys.suspend/1`, and
 records the VM monotonic timestamp immediately after that call acknowledges.
-The already-running public WebSocket traffic exercises the real Capacity
-mutation timeout. The first replacement observation must be no earlier than the
-deployed timeout and no later than that timeout plus
+The script then sends `SIGUSR1` to the target load process, which immediately
+starts data in both directions on every pair plus control ping traffic. Because
+the handler is installed before socket setup and target publishing begins only
+after acknowledgement, that acknowledgement is the lower-bound clock origin
+for the real Capacity mutation timeout. The first replacement observation must
+be no earlier than the deployed timeout and no later than that timeout plus
 `PASEO_FLY_REPLACEMENT_TOLERANCE_MS`, which defaults to 1,000 ms and must be
-between 1 and 5,000 ms. The retained `timing.json` records the acknowledged-suspension and
-replacement-observation VM monotonic timestamps plus their difference. All
+between 1 and 5,000 ms. The retained `timing.json` records the
+acknowledged-suspension and replacement-observation VM monotonic timestamps,
+their difference, and the post-acknowledgement publisher signal. All
 7,667 old target sockets must report abnormal epoch disconnects; the two
 unaffected shard JSON results allow zero connection failures, send failures,
 ordering failures, cleanup timeouts, or frame loss. After replacement readiness,

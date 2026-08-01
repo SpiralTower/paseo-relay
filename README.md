@@ -158,6 +158,9 @@ mode. Fly's short manual procedure starts three ordinary sustained-load
 processes through exact-Machine proxies and owns only Fly-specific fault and
 cleanup commands. See [deployment/fly/README.md](deployment/fly/README.md) for
 the fixed 23,001-WebSocket command, operator inputs, and numeric pass criteria.
+The target shard establishes its sockets without publishing, then starts its
+data/control publisher only after Capacity suspension acknowledges; the two
+unaffected shards publish continuously.
 The documented contract uses `PASEO_FLY_EXPECTED_CONNECTION_CEILING`, requires
 all old target sockets to drain, and then runs a full same-`serverId`
 replacement shard inside the configured timeout tolerance. That destructive
