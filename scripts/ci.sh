@@ -86,6 +86,14 @@ assert_operations_contract() {
   grep --quiet '^paseo_relay_ready 1$' <<<"${metrics}"
 }
 
+print_bounded_rpc_output() {
+  local label="$1"
+  local output="$2"
+
+  echo "${label} (last 4096 bytes):" >&2
+  printf '%s\n' "${output}" | tail -c 4096 >&2
+}
+
 mix deps.get
 mix hex.audit
 mix format --check-formatted
@@ -160,21 +168,24 @@ if ! wait_for_endpoint "http://127.0.0.1:${fly_port}/health"; then
 fi
 assert_operations_contract "http://127.0.0.1:${fly_port}"
 
-docker exec "${fly_container}" sh -lc \
-  'RELEASE_NODE="paseo_relay@$FLY_PRIVATE_IP" RELEASE_DISTRIBUTION=name ERL_AFLAGS="-proto_dist inet6_tcp" /app/bin/paseo_relay rpc '\''PaseoRelay.FlyDiagnostics.print_snapshot("WyJjaS11bm93bmVkIl0")'\''' \
-  | node --input-type=module -e '
-      let input = "";
-      for await (const chunk of process.stdin) input += chunk;
-      const snapshot = JSON.parse(input.trim());
-      if (snapshot.schema !== 1 || snapshot.machine_id !== "ci-machine" ||
-          snapshot.private_ip !== "::1" || snapshot.release_node !== "paseo_relay@::1" ||
-          snapshot.owners["ci-unowned"] !== "unowned" ||
-          !/^\d+$/.test(snapshot.release_os_pid) ||
-          snapshot.connection_ceiling !== 20000 ||
-          snapshot.capacity_mutation_timeout_ms !== 5000 ||
-          !/^<\d+\.\d+\.\d+>$/.test(snapshot.capacity_pid)) process.exit(1);
-    '
+if ! fly_snapshot_output="$(docker exec "${fly_container}" sh -lc \
+  'RELEASE_NODE="paseo_relay@$FLY_PRIVATE_IP" RELEASE_DISTRIBUTION=name ERL_AFLAGS="-proto_dist inet6_tcp" ELIXIR_ERL_OPTIONS="+fnu" /app/bin/paseo_relay rpc '\''PaseoRelay.FlyDiagnostics.print_snapshot("WyJjaS11bm93bmVkIl0")'\''' 2>&1)"; then
+  print_bounded_rpc_output "Fly diagnostic RPC failed" "${fly_snapshot_output}"
+  exit 1
+fi
 
-replay_output="$(docker exec "${fly_container}" sh -lc \
-  'RELEASE_NODE="paseo_relay@$FLY_PRIVATE_IP" RELEASE_DISTRIBUTION=name ERL_AFLAGS="-proto_dist inet6_tcp" /app/bin/paseo_relay rpc '\''Code.require_file("/app/diagnostics/replay-e2e.exs"); PaseoRelay.FlyReplayE2E.run(["--endpoint", "ws://127.0.0.1:4000", "--owner", "ci-machine", "--landing", "ci-machine"])'\''')"
-grep --quiet '"status":"ok"' <<<"${replay_output}"
+if ! printf '%s\n' "${fly_snapshot_output}" | node deployment/fly/validate-snapshot.mjs; then
+  print_bounded_rpc_output "Fly diagnostic RPC output" "${fly_snapshot_output}"
+  exit 1
+fi
+
+if ! replay_output="$(docker exec "${fly_container}" sh -lc \
+  'RELEASE_NODE="paseo_relay@$FLY_PRIVATE_IP" RELEASE_DISTRIBUTION=name ERL_AFLAGS="-proto_dist inet6_tcp" ELIXIR_ERL_OPTIONS="+fnu" /app/bin/paseo_relay rpc '\''Code.require_file("/app/diagnostics/replay-e2e.exs"); PaseoRelay.FlyReplayE2E.run(["--endpoint", "ws://127.0.0.1:4000", "--owner", "ci-machine", "--landing", "ci-machine"])'\''' 2>&1)"; then
+  print_bounded_rpc_output "Fly replay RPC failed" "${replay_output}"
+  exit 1
+fi
+
+if ! grep --quiet '"status":"ok"' <<<"${replay_output}"; then
+  print_bounded_rpc_output "Fly replay RPC output" "${replay_output}"
+  exit 1
+fi

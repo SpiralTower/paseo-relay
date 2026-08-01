@@ -841,3 +841,12 @@
   35-second transport-send contract. Each exact regression passed 10/10; both
   full files passed twice, and the complete 95-test suite passed at seeds
   `441625`, `804904`, and `818179` with `max_cases: 8`.
+- Exact-image RPC red: hosted run `30715263257` reached the Fly diagnostic RPC
+  after every preceding suite, release, image, boot, and load check passed, then
+  exited 1 without showing the snapshot. A local release RPC reproduced the
+  exact fields and exposed the mismatch: `capacity_pid` is `#PID<0.986.0>`,
+  while the silent validator required `<0.986.0>`.
+- Exact-image RPC green: the executable validator accepts one bounded JSON line
+  amid launcher noise, validates the real `#PID<n.n.n>` representation and all
+  prior identity/config/ownership fields, and reports exact field mismatches.
+  The focused diagnostic boundary passed 2/2.

@@ -5,6 +5,37 @@ defmodule PaseoRelay.FlyDiagnosticsTest do
 
   import ExUnit.CaptureIO
 
+  @snapshot_validator Path.expand("../deployment/fly/validate-snapshot.mjs", __DIR__)
+
+  @tag :tmp_dir
+  test "exact-image snapshot validation ignores launcher noise and checks the real PID shape", %{
+    tmp_dir: dir
+  } do
+    snapshot = %{
+      "schema" => 1,
+      "machine_id" => "ci-machine",
+      "private_ip" => "::1",
+      "release_node" => "paseo_relay@::1",
+      "release_os_pid" => "4130",
+      "owners" => %{"ci-unowned" => "unowned"},
+      "connection_ceiling" => 20_000,
+      "capacity_mutation_timeout_ms" => 5_000,
+      "capacity_pid" => "#PID<0.986.0>"
+    }
+
+    valid = Path.join(dir, "valid-output")
+    File.write!(valid, "warning: native name encoding is latin1\n" <> Jason.encode!(snapshot))
+    assert {"", 0} = run_snapshot_validator(valid)
+
+    invalid = Path.join(dir, "invalid-output")
+    File.write!(invalid, Jason.encode!(%{snapshot | "capacity_pid" => "<0.986.0>"}))
+
+    assert {output, 1} = run_snapshot_validator(invalid)
+
+    assert output ==
+             "Fly diagnostic snapshot invalid: capacity_pid expected \"#PID<n.n.n>\", actual \"<0.986.0>\"\n"
+  end
+
   @tag timeout: 8_000
   test "interruption cleanup kills the acknowledged Capacity epoch and readiness recovers" do
     old_machine = System.get_env("FLY_MACHINE_ID")
@@ -120,4 +151,12 @@ defmodule PaseoRelay.FlyDiagnosticsTest do
 
   defp restore_env(name, nil), do: System.delete_env(name)
   defp restore_env(name, value), do: System.put_env(name, value)
+
+  defp run_snapshot_validator(path) do
+    System.cmd(
+      "sh",
+      ["-c", ~s(exec node "$1" < "$2"), "snapshot-validator", @snapshot_validator, path],
+      stderr_to_stdout: true
+    )
+  end
 end
