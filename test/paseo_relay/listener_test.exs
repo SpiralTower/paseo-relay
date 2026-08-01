@@ -361,6 +361,12 @@ defmodule PaseoRelay.ListenerTest do
     port = PaseoRelay.Listener.port(PaseoRelay.Listener)
     first = open_websocket(port, "pressure-batch-first")
     second = open_websocket(port, "pressure-batch-second")
+
+    assert_eventually(
+      fn -> PaseoRelay.Metrics.value(:active_websockets) == 2 end,
+      @capacity_mutation_timeout_ms
+    )
+
     padding = :binary.copy(<<0x4D>>, 40 * 1024 * 1024)
     maximum_message = PaseoRelay.Protocol.maximum_message_payload_bytes()
     :erlang.garbage_collect(self())
@@ -372,6 +378,11 @@ defmodule PaseoRelay.ListenerTest do
     assert :ok = PaseoRelay.Capacity.check_now(@capacity_mutation_timeout_ms)
     assert byte_size(padding) == 40 * 1024 * 1024
     assert :ok = PaseoRelay.Capacity.set_watermark(0, @capacity_mutation_timeout_ms)
+
+    assert_eventually(
+      fn -> PaseoRelay.Metrics.value(:active_websockets) == 0 end,
+      @capacity_mutation_timeout_ms
+    )
 
     assert {:close, 1013, "Relay memory pressure"} = recv_until_close(first)
     assert {:close, 1013, "Relay memory pressure"} = recv_until_close(second)

@@ -830,3 +830,14 @@
   direct diagnostic/replay compilation, and the production release passed. A
   bounded five-second Docker probe timed out, so no local Docker build is
   claimed. The 23,001-socket staging gate was not run.
+- Hosted-CI fixture red: run `30714599694` (seed `441625`, `max_cases: 8`)
+  observed the first pressure close but timed out reading the second socket after
+  two seconds, and separately timed out after fifteen seconds waiting for the
+  fragmented 32 MiB digest despite an empty test mailbox.
+- Hosted-CI fixture green: the pressure test now observes both live admissions
+  before its single pressure check and zero active WebSockets before inspecting
+  the two buffered close frames. The fragmented test observes both public
+  endpoints attached before sending and bounds digest receipt by the configured
+  35-second transport-send contract. Each exact regression passed 10/10; both
+  full files passed twice, and the complete 95-test suite passed at seeds
+  `441625`, `804904`, and `818179` with `max_cases: 8`.

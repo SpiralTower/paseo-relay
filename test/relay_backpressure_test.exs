@@ -10,6 +10,7 @@ defmodule PaseoRelay.BackpressureTest do
                                         @maximum_client_frame_header_bytes
   @maximum_message_payload_bytes PaseoRelay.Protocol.maximum_message_payload_bytes()
   @capacity_mutation_timeout_ms PaseoRelay.Config.defaults().capacity_mutation_timeout_ms
+  @transport_send_timeout_ms PaseoRelay.Config.defaults().transport_send_timeout_ms
   @maximum_control_payload_bytes PaseoRelay.Protocol.maximum_control_payload_bytes()
   @control_setup_timeout_ms 3_000
 
@@ -319,12 +320,13 @@ defmodule PaseoRelay.BackpressureTest do
     await_metric(:active_websockets, &(&1 == 0))
   end
 
-  @tag timeout: 30_000
+  @tag timeout: 45_000
   test "a fragmented maximum-size message permits an interleaved control frame" do
     port = start_relay()
     server_id = "maximum-fragmented-#{port}"
     destination = digest_connect(v2_url(port, server_id, "server", "shared"))
     source = raw_connect(port, "/ws?serverId=#{server_id}&role=client&v=2&connectionId=shared")
+    await_metric(:active_websockets, &(&1 == 2))
     half = :binary.copy(<<0x3C>>, div(@maximum_message_payload_bytes, 2))
     digest = :crypto.hash(:sha256, half <> half)
 
@@ -335,7 +337,7 @@ defmodule PaseoRelay.BackpressureTest do
 
     assert_receive {:digest_frame, ^destination, :binary, @maximum_message_payload_bytes,
                     ^digest},
-                   15_000
+                   @transport_send_timeout_ms
 
     await_reserved(&(&1 == 0))
     close_raw(source)
