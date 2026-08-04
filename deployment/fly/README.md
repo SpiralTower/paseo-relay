@@ -75,13 +75,11 @@ The entrypoint raises the per-process file descriptor limit to 100,000 by
 default. Override `PASEO_RELAY_NOFILE` when a deployment needs a different
 ceiling. The sample VM size and connection limits in `fly.toml` are starting
 points, not universal capacity claims; validate them against the deployment's
-traffic and memory profile. The sample 2 GiB Machine explicitly enables the
-1.5 GiB BEAM memory watermark in `fly.toml`; recalculate or disable that value
-when changing Machine memory rather than inheriting a deployment-specific
-threshold blindly.
+traffic and memory profile. The generic template leaves the BEAM memory
+watermark disabled because its safe value depends on the live Machine size;
+set it explicitly only after validating the deployment's memory profile.
 
-The template explicitly selects a provisional 5,000 ms Capacity mutation
-timeout. Before rollout, run this destructive gate only against a disposable
+Before rollout, run this destructive gate only against a disposable
 three-Machine staging app of the intended size:
 
 ```sh
