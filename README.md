@@ -99,6 +99,14 @@ the ledger stops the production listener and its existing connections before a
 fresh ledger can reopen admission. Budget exhaustion closes that source with
 retryable `1013`.
 
+Client-originated JSON frames with type `hello` or `e2ee_hello` are the narrow
+exception to opaque forwarding. After message-capacity admission, a stateless
+validation requires the `key` to be canonical padded Base64 for a canonical
+32-byte X25519 public key and rejects unsupported values. It checks every
+matching text or binary frame on both routing versions; other frames remain
+opaque. A rejection is never forwarded and closes the client with `1008 Invalid
+handshake key`.
+
 The compatible masked data-frame ceiling remains exactly 32 MiB, which permits
 `32 MiB - 14 bytes` of payload. Cowboy applies that payload limit to individual
 frames and reassembled fragmented messages and closes an oversized message with

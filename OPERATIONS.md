@@ -272,6 +272,13 @@ with room for the configured ingress budget and VM overhead.
   watermark is disabled because the safe threshold depends on the runtime
   limit; a strict generic deployment must set a nonzero threshold. The 2 GB Fly
   template enables it at 1.5 GB.
+- **A client sends an invalid X25519 handshake key:** after ingress admission,
+  the relay checks every JSON `hello` and `e2ee_hello` frame on both routing
+  versions, regardless of text or binary opcode. Malformed Base64, invalid
+  encodings, and unsupported public keys close only that client with `1008
+  Invalid handshake key`; the frame is never forwarded. The validation stores
+  no handshake phase, does not inspect daemon-originated frames, and never logs
+  key material or `serverId`.
 - **Two nodes concurrently claim a previously unowned `serverId`:** Syn favors
   availability, so both WebSockets can initially open against different local
   owners. Conflict resolution keeps one owner and closes sockets on the loser
@@ -324,6 +331,13 @@ Fly scrapes `/metrics` every 15 seconds when the deployment adapter's metrics
 configuration is enabled. Custom series are local to a Machine and receive Fly
 labels such as app, region, host, and instance. Do not add `serverId` or
 `connectionId` as labels; their cardinality is unbounded.
+
+`paseo_relay_handshake_accepted_total` and
+`paseo_relay_handshake_rejected_total` expose the protocol validation with only
+the fixed `routing_version` (`v1`/`v2`) and `type`
+(`hello`/`e2ee_hello`) labels. They count matching client frames accepted or
+rejected by the validation; they never contain route identifiers or key
+material.
 
 The endpoint fetches Capacity availability, admission state, and all transient
 capacity gauges in one bounded ledger call. If that authority is stalled, the

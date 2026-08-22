@@ -54,7 +54,15 @@ defmodule PaseoRelay.Metrics do
   ]
   @computed_names ~w(active_websockets active_sessions ingress_reserved_bytes inflight_delivery_bytes backpressured_sources max_frame_bytes beam_total_memory beam_process_memory beam_binary_memory beam_ets_memory)a
   @capacity_names ~w(active_websockets ingress_reserved_bytes inflight_delivery_bytes backpressured_sources)a
+  @handshake_outcomes [:accepted, :rejected]
+  @handshake_versions [1, 2]
+  @handshake_types [:hello, :e2ee_hello]
+  @handshake_counter_names for outcome <- @handshake_outcomes,
+                               version <- @handshake_versions,
+                               type <- @handshake_types,
+                               do: {:handshake, outcome, version, type}
   @counter_names (@metrics |> Enum.map(&elem(&1, 0)) |> Kernel.--(@computed_names)) ++
+                   @handshake_counter_names ++
                    [
                      :delivery_wait_microseconds,
                      :delivery_wait_count,
@@ -124,6 +132,12 @@ defmodule PaseoRelay.Metrics do
     put_max_frame(byte_count)
   end
 
+  def observe_handshake(outcome, version, type)
+      when outcome in @handshake_outcomes and version in @handshake_versions and
+             type in @handshake_types do
+    inc({:handshake, outcome, version, type})
+  end
+
   def render(capacity_status) do
     capacity =
       case capacity_status do
@@ -133,6 +147,7 @@ defmodule PaseoRelay.Metrics do
 
     [
       render_metrics(snapshot(capacity)),
+      render_handshake_metrics(),
       render_delivery_histogram(),
       render_frame_histogram()
     ]
@@ -225,6 +240,23 @@ defmodule PaseoRelay.Metrics do
          "#{name}_count #{value(:delivery_wait_count)}"
        ])
     |> Enum.join("\n")
+  end
+
+  defp render_handshake_metrics do
+    Enum.map_join(@handshake_outcomes, "\n", fn outcome ->
+      name = "paseo_relay_handshake_#{outcome}_total"
+
+      series =
+        for version <- @handshake_versions, type <- @handshake_types do
+          ~s(#{name}{routing_version="v#{version}",type="#{type}"} #{value({:handshake, outcome, version, type})})
+        end
+
+      ([
+         "# HELP #{name} Client E2EE handshake frames #{outcome} by the handshake input validator.",
+         "# TYPE #{name} counter"
+       ] ++ series)
+      |> Enum.join("\n")
+    end)
   end
 
   defp render_frame_histogram do

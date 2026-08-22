@@ -7,6 +7,7 @@ defmodule PaseoRelay.Socket do
   alias PaseoRelay.Delivery
   alias PaseoRelay.Delivery.Deadline
   alias PaseoRelay.Delivery.Writer
+  alias PaseoRelay.HandshakeValidation
   alias PaseoRelay.Ownership.Owner
 
   @impl true
@@ -177,12 +178,31 @@ defmodule PaseoRelay.Socket do
 
   def terminate(_reason, _request, _state), do: :ok
 
-  defp admit_input(opcode, payload, token, %{delivery: _delivery} = state) do
+  defp admit_input(opcode, payload, token, %{connection: %{role: :client}} = state) do
+    case HandshakeValidation.check(opcode, payload) do
+      :not_handshake ->
+        forward_admitted_input(opcode, payload, token, state)
+
+      {:accept, type} ->
+        PaseoRelay.Metrics.observe_handshake(:accepted, state.connection.version, type)
+        forward_admitted_input(opcode, payload, token, state)
+
+      {:reject, type} ->
+        PaseoRelay.Metrics.observe_handshake(:rejected, state.connection.version, type)
+        :ok = PaseoRelay.Capacity.finish_message(token)
+        {[{:close, 1008, "Invalid handshake key"}], state}
+    end
+  end
+
+  defp admit_input(opcode, payload, token, state),
+    do: forward_admitted_input(opcode, payload, token, state)
+
+  defp forward_admitted_input(opcode, payload, token, %{delivery: _delivery} = state) do
     pending = :queue.in({opcode, payload, token}, state.pending)
     {[{:active, false}], %{state | pending: pending}}
   end
 
-  defp admit_input(opcode, payload, token, state) do
+  defp forward_admitted_input(opcode, payload, token, state) do
     case start_delivery(opcode, payload, token, state) do
       {:ok, state} -> {[{:active, false}], state}
       {:error, state} -> {[{:close, 1013, "Relay memory pressure"}], state}

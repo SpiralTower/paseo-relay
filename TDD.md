@@ -892,3 +892,23 @@
   identifier, closes data before client before control, and leaves zero active
   WebSockets after three probes. A failed-upgrade regression also reports the
   socket role and reason instead of a `MatchError`.
+
+## Validate client X25519 handshake inputs
+
+- Red: focused real-WebSocket regressions demonstrated the missing validation
+  behavior for `e2ee_hello` and legacy `hello` frames on v1 and v2.
+- Green: one stateless `HandshakeValidation.check/2` boundary now classifies
+  every matching client text or binary frame after Capacity admission.
+  Canonical Base64, exact key length, and a supported public-key encoding are
+  required before forwarding. A rejection finishes its admitted message token,
+  increments one fixed-dimension counter, closes the client with `1008`, and is
+  not delivered. No handshake phase is retained.
+- Coverage: unit tests exercise a generated valid X25519 key across both
+  opcodes and both handshake type names, plus malformed, incorrectly sized, and
+  unsupported encodings. Real v1/v2 sockets prove unchanged forwarding, retry
+  handling, binary legacy input, pipelined frames, rejection behavior, and
+  accepted/rejected metric increments.
+- Final targeted gate: `asdf exec mix test
+  test/paseo_relay/handshake_validation_test.exs test/relay_protocol_test.exs`
+  passed 20/20 in 81.4 seconds. `asdf exec mix format`, `asdf exec mix compile
+  --warnings-as-errors --force`, and `git diff --check` exited zero.

@@ -243,6 +243,80 @@ defmodule PaseoRelay.RelayProtocolTest do
     close_clients([client, original, replacement])
   end
 
+  test "v1 validates every current handshake retry before forwarding" do
+    port = start_relay()
+
+    {:ok, daemon} = connect(v1_url(port, "server"))
+    assert_receive {:relay_open, ^daemon}
+
+    {:ok, client} = connect(v1_url(port, "client"))
+    assert_receive {:relay_open, ^client}
+
+    accepted = handshake_metric(:accepted, 1, :e2ee_hello)
+    rejected = handshake_metric(:rejected, 1, :e2ee_hello)
+    hello = handshake("e2ee_hello", valid_public_key())
+    invalid_key = handshake("e2ee_hello", <<0::256>>)
+
+    :ok = WebSockex.send_frame(client, {:text, hello})
+    assert_receive {:relay_frame, ^daemon, :text, ^hello}
+
+    :ok = WebSockex.send_frame(client, {:text, hello})
+    assert_receive {:relay_frame, ^daemon, :text, ^hello}
+
+    :ok = WebSockex.send_frame(client, {:text, invalid_key})
+    assert_receive {:relay_closed, ^client, {:remote, 1008, "Invalid handshake key"}}
+    refute_receive {:relay_frame, ^daemon, :text, ^invalid_key}, 100
+    assert handshake_metric(:accepted, 1, :e2ee_hello) == accepted + 2
+    assert handshake_metric(:rejected, 1, :e2ee_hello) == rejected + 1
+
+    close_clients([daemon, client])
+  end
+
+  test "v2 validates legacy binary handshakes without breaking pipelined ciphertext" do
+    port = start_relay()
+
+    {:ok, control} = connect(v2_url(port, "server"))
+    assert_receive {:relay_open, ^control}
+    assert_control(control, %{"type" => "sync", "connectionIds" => []})
+
+    {:ok, client} = connect(v2_url(port, "client", "clt_handshake_validation"))
+    assert_receive {:relay_open, ^client}
+
+    assert_control(control, %{
+      "type" => "connected",
+      "connectionId" => "clt_handshake_validation"
+    })
+
+    {:ok, data} = connect(v2_url(port, "server", "clt_handshake_validation"))
+    assert_receive {:relay_open, ^data}
+
+    accepted = handshake_metric(:accepted, 2, :hello)
+    rejected = handshake_metric(:rejected, 2, :hello)
+    hello = handshake("hello", valid_public_key())
+    ciphertext = :binary.copy(<<0xA5>>, 48)
+
+    :ok = WebSockex.send_frame(client, {:binary, hello})
+    :ok = WebSockex.send_frame(client, {:binary, ciphertext})
+
+    assert_receive {:relay_frame, ^data, :binary, ^hello}
+    assert_receive {:relay_frame, ^data, :binary, ^ciphertext}
+
+    invalid_key =
+      handshake(
+        "hello",
+        Base.decode16!("E0EB7A7C3B41B8AE1656E3FAF19FC46ADA098DEB9C32B1FD866205165F49B800")
+      )
+
+    :ok = WebSockex.send_frame(client, {:binary, invalid_key})
+
+    assert_receive {:relay_closed, ^client, {:remote, 1008, "Invalid handshake key"}}
+    refute_receive {:relay_frame, ^data, :binary, ^invalid_key}, 100
+    assert handshake_metric(:accepted, 2, :hello) == accepted + 1
+    assert handshake_metric(:rejected, 2, :hello) == rejected + 1
+
+    close_clients([control, data, client])
+  end
+
   defp v1_url(port, role) do
     "ws://127.0.0.1:#{port}/ws?serverId=srv_v1&role=#{role}"
   end
@@ -334,5 +408,18 @@ defmodule PaseoRelay.RelayProtocolTest do
     assert %{"type" => ^type, "ts" => ts} = Jason.decode!(payload)
     assert is_integer(ts)
     payload
+  end
+
+  defp valid_public_key do
+    {public_key, _private_key} = :crypto.generate_key(:ecdh, :x25519)
+    public_key
+  end
+
+  defp handshake(type, public_key) do
+    Jason.encode!(%{type: type, key: Base.encode64(public_key), capabilities: %{}})
+  end
+
+  defp handshake_metric(outcome, version, type) do
+    PaseoRelay.Metrics.value({:handshake, outcome, version, type})
   end
 end
